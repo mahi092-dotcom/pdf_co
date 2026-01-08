@@ -45,6 +45,11 @@ def _maybe_to_gpu(index: faiss.Index) -> faiss.Index:
         except Exception: return index
     return index
 
+def build_index(embeddings: np.ndarray) -> faiss.IndexIDMap:
+    dim = embeddings.shape[1]
+    base_index = faiss.IndexFlatIP(dim)   # fast similarity search
+    return faiss.IndexIDMap(base_index)   # adds ID support
+
 # -------------------------
 # Analyzer
 # -------------------------
@@ -62,7 +67,7 @@ class UltraEfficientPDFAnalyzer:
         if not chunks: raise ValueError("No readable text extracted")
 
         embeddings = batch_encode(self.model, chunks)
-        index = faiss.IndexFlatIP(embeddings.shape[1])
+        index = build_index(embeddings)
         index = _maybe_to_gpu(index)
         ids = np.arange(len(chunks), dtype="int64")
         index.add_with_ids(embeddings, ids)
@@ -99,7 +104,7 @@ class UltraEfficientPDFAnalyzer:
 # -------------------------
 # Streamlit App
 # -------------------------
-st.title("CHATBOT PDF ANALYZER")
+st.title("⚡ The Most Efficient PDF Analyzer (After Copilot)")
 
 analyzer = UltraEfficientPDFAnalyzer()
 
