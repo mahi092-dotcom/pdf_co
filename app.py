@@ -103,7 +103,7 @@ class EfficientPDFAnalyzer:
 # -------------------------
 # Streamlit App with Animations
 # -------------------------
-st.title("📄 Advanced PDF Analyzer (Optimized + Animated)")
+st.title("📄 PDF Analyzer Chat Bot ")
 
 analyzer = EfficientPDFAnalyzer()
 
@@ -112,6 +112,7 @@ st.info("📂 Ready to browse files... Upload a PDF to analyze!")
 
 uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
 if uploaded_file is not None:
+    # Settings gear spinner during indexing
     with st.spinner("⚙️ Indexing your PDF... Please wait"):
         try:
             meta = analyzer.index_pdf(uploaded_file)
@@ -124,8 +125,9 @@ if uploaded_file is not None:
 if "doc_id" in st.session_state:
     query = st.text_input("Enter search query")
     if st.button("Search"):
+        # Simple search animation
         with st.spinner("🔍 Searching your document..."):
-            time.sleep(1)  # simple search animation
+            time.sleep(1)  # simulate animation
             try:
                 results = analyzer.search(query, top_k=5)
                 st.success("✨ Results ready!")
