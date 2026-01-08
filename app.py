@@ -180,7 +180,7 @@ if "doc_id" in st.session_state:
                 st.success("✨ Results ready!")
                 st.write("### 🔍 Search Results")
                 for sentence in results:
-                    st.markdown(f"- 🚀 {sentence}")
+                    st.markdown(f"- 👉 {sentence}")
             except Exception as e:
                 st.error(f"Error during search: {e}")
 
