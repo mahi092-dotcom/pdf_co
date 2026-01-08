@@ -8,6 +8,7 @@ from PyPDF2 import PdfReader
 import re
 import streamlit as st
 from typing import List, Dict, Any, Optional
+import time
 
 # -------------------------
 # Config
@@ -70,9 +71,10 @@ def _maybe_to_gpu(index: faiss.Index) -> faiss.Index:
 
 def build_index(embeddings: np.ndarray) -> faiss.IndexIDMap2:
     dim = embeddings.shape[1]
-    # Use HNSW for efficient retrieval
-    hnsw_index = faiss.IndexHNSWFlat(dim, 32)  # 32 neighbors
-    return faiss.IndexIDMap2(hnsw_index)
+    quantizer = faiss.IndexFlatIP(dim)
+    index = faiss.IndexIVFPQ(quantizer, dim, 100, 8, 8)  # 100 clusters, PQ compression
+    index.train(embeddings)
+    return faiss.IndexIDMap2(index)
 
 def save_index(index: faiss.Index, path: str):
     faiss.write_index(index, path)
@@ -98,7 +100,7 @@ class EfficientPDFAnalyzer:
         if not reindex:
             meta, index = load_meta(meta_path), load_index(idx_path)
             if index is not None and meta.get("sentences"):
-                return {"status": "loaded", "doc_id": doc_id, "count": len(meta["sentences"]), "index_type": meta.get("config", {}).get("index_type", "HNSW")}
+                return {"status": "loaded", "doc_id": doc_id, "count": len(meta["sentences"]), "index_type": meta.get("config", {}).get("index_type", "IVFPQ")}
 
         sentences = split_sentences(read_pdf_text(pdf_source))
         if not sentences:
@@ -111,8 +113,8 @@ class EfficientPDFAnalyzer:
         index.add_with_ids(embeddings, ids)
 
         save_index(base_index, idx_path)
-        save_meta(meta_path, sentences, ids.tolist(), {"index_type": "HNSW"})
-        return {"status": "indexed", "doc_id": doc_id, "count": len(sentences), "index_type": "HNSW"}
+        save_meta(meta_path, sentences, ids.tolist(), {"index_type": "IVFPQ"})
+        return {"status": "indexed", "doc_id": doc_id, "count": len(sentences), "index_type": "IVFPQ"}
 
     def search(self, query: str, doc_id: str, top_k: int = 3) -> List[str]:
         meta_path, idx_path = meta_paths(doc_id, self.store_dir)
@@ -125,13 +127,12 @@ class EfficientPDFAnalyzer:
             raise ValueError("Index file missing or unreadable")
 
         q_emb = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype("float32")
-        _, I = index.search(q_emb, min(top_k*3, index.ntotal))  # get more candidates
+        _, I = index.search(q_emb, min(top_k*10, index.ntotal))  # get more candidates
 
-        candidates = [sentences[int(idx)] for idx in I[0] if idx != -1]
+        candidates = [sentences[int(idx)] for idx in I[0] if idx != -1][:15]
         if not candidates:
             return []
 
-        # Rerank with cross-encoder
         pairs = [(query, cand) for cand in candidates]
         scores = self.reranker.predict(pairs)
         ranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
@@ -153,34 +154,43 @@ class EfficientPDFAnalyzer:
 # -------------------------
 # Streamlit App
 # -------------------------
-st.title("📄 Advanced PDF Analyzer (Optimized)")
+st.title("📄 Advanced PDF Analyzer (Optimized + Animated)")
 
 analyzer = EfficientPDFAnalyzer()
 
 uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
 if uploaded_file is not None:
-    try:
-        meta = analyzer.index_pdf(uploaded_file)
-        st.success(f"Indexed {meta['count']} sentences from {uploaded_file.name} (Index type: {meta['index_type']})")
-        st.session_state["doc_id"] = meta["doc_id"]
-    except Exception as e:
-        st.error(f"Error indexing PDF: {e}")
+    with st.spinner("⚙️ Indexing your PDF..."):
+        time.sleep(1.5)
+        try:
+            meta = analyzer.index_pdf(uploaded_file)
+            st.success(f"✅ Indexed {meta['count']} sentences from {uploaded_file.name} (Index type: {meta['index_type']})")
+            st.session_state["doc_id"] = meta["doc_id"]
+            st.balloons()
+        except Exception as e:
+            st.error(f"Error indexing PDF: {e}")
 
 if "doc_id" in st.session_state:
     query = st.text_input("Enter search query")
     if st.button("Search"):
-        try:
-            results = analyzer.search(query, st.session_state["doc_id"], top_k=5)
-            st.write("### 🔍 Search Results")
-            for sentence in results:
-                st.write(f"- {sentence}")
-        except Exception as e:
-            st.error(f"Error during search: {e}")
+        with st.spinner("🔍 Searching..."):
+            time.sleep(1.2)
+            try:
+                results = analyzer.search(query, st.session_state["doc_id"], top_k=5)
+                st.success("✨ Results ready!")
+                st.write("### 🔍 Search Results")
+                for sentence in results:
+                    st.markdown(f"- 🚀 {sentence}")
+            except Exception as e:
+                st.error(f"Error during search: {e}")
 
     if st.button("Generate Summary"):
-        try:
-            summary_text = analyzer.extractive_summary(st.session_state["doc_id"], num_sentences=SUMMARY_SENTENCES)
-            st.write("### 📌 Extractive Summary")
-            st.write(summary_text)
-        except Exception as e:
-            st.error(f"Error generating summary: {e}")
+        with st.spinner("📌 Summarizing..."):
+            time.sleep(2)
+            try:
+                summary_text = analyzer.extractive_summary(st.session_state["doc_id"], num_sentences=SUMMARY_SENTENCES)
+                st.balloons()
+                st.write("### 📌 Extractive Summary")
+                st.info(summary_text)
+            except Exception as e:
+                st.error(f"Error generating summary: {e}")
