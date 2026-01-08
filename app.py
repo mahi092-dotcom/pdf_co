@@ -7,7 +7,7 @@ from sentence_transformers import SentenceTransformer
 from PyPDF2 import PdfReader
 import re
 import streamlit as st
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 
 # -------------------------
 # Config
@@ -15,8 +15,6 @@ from typing import List, Dict, Any, Optional, Tuple
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 STORE_DIR = "store"
 USE_GPU = True
-DEFAULT_NLIST = 128
-DEFAULT_NPROBE = 8
 IVF_THRESHOLD = 500
 SUMMARY_SENTENCES = 5
 
@@ -43,7 +41,7 @@ def split_sentences(text: str) -> List[str]:
     return [s for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s]
 
 def batch_encode(model, sentences: List[str]) -> np.ndarray:
-    return model.encode(sentences, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
+    return model.encode(sentences, convert_to_numpy=True, normalize_embeddings=True, batch_size=32).astype("float32")
 
 def save_meta(meta_path: str, sentences: List[str], ids: List[int], config: Dict[str, Any]):
     atomic_write_json(meta_path, {"sentences": sentences, "ids": ids, "config": config})
@@ -68,22 +66,19 @@ def _maybe_to_gpu(index: faiss.Index) -> faiss.Index:
             return index
     return index
 
-def build_index(embeddings: np.ndarray, use_ivf: bool = False, nlist: int = DEFAULT_NLIST, nprobe: int = DEFAULT_NPROBE) -> faiss.IndexIDMap2:
+def build_index(embeddings: np.ndarray, use_ivf: bool = False) -> faiss.IndexIDMap2:
     dim = embeddings.shape[1]
-    if not use_ivf or embeddings.shape[0] < 2 * nlist:
+    if not use_ivf or embeddings.shape[0] < 2 * 128:
         return faiss.IndexIDMap2(faiss.IndexFlatIP(dim))
     quantizer = faiss.IndexFlatIP(dim)
-    index_ivf = faiss.IndexIVFFlat(quantizer, dim, nlist, faiss.METRIC_INNER_PRODUCT)
-    try:
-        index_ivf.train(embeddings)
-        index_ivf.nprobe = max(1, min(nprobe, nlist))
-        return faiss.IndexIDMap2(index_ivf)
-    except Exception:
-        return faiss.IndexIDMap2(faiss.IndexFlatIP(dim))
+    index_ivf = faiss.IndexIVFFlat(quantizer, dim, 128, faiss.METRIC_INNER_PRODUCT)
+    index_ivf.train(embeddings)
+    index_ivf.nprobe = 8
+    return faiss.IndexIDMap2(index_ivf)
 
 def save_index(index: faiss.Index, path: str):
-    cpu_index = faiss.index_gpu_to_cpu(index) if USE_GPU else index
-    faiss.write_index(cpu_index, path)
+    # Always save CPU index
+    faiss.write_index(index, path)
 
 def load_index(path: str) -> Optional[faiss.Index]:
     return faiss.read_index(path) if os.path.exists(path) else None
@@ -113,21 +108,20 @@ class EfficientPDFAnalyzer:
 
         embeddings = batch_encode(self.model, sentences)
         use_ivf = len(sentences) > IVF_THRESHOLD
-        nlist = min(1024, max(64, int(len(sentences) ** 0.5) * 4))
-        nprobe = min(64, max(8, nlist // 16)) if use_ivf else 0
 
-        base_index = build_index(embeddings, use_ivf=use_ivf, nlist=nlist, nprobe=nprobe)
+        base_index = build_index(embeddings, use_ivf=use_ivf)
         index = _maybe_to_gpu(base_index)
         ids = np.arange(len(sentences), dtype="int64")
         index.add_with_ids(embeddings, ids)
 
         save_index(base_index, idx_path)
-        save_meta(meta_path, sentences, ids.tolist(), {"index_type": "IVF" if use_ivf else "Flat", "nlist": nlist, "nprobe": nprobe})
+        save_meta(meta_path, sentences, ids.tolist(), {"index_type": "IVF" if use_ivf else "Flat"})
         return {"status": "indexed", "doc_id": doc_id, "count": len(sentences), "index_type": "IVF" if use_ivf else "Flat"}
 
-    def search(self, query: str, doc_id: str, top_k: int = 3) -> List[Tuple[int, float, str]]:
+    def search(self, query: str, doc_id: str, top_k: int = 3) -> List[str]:
         meta_path, idx_path = meta_paths(doc_id, self.store_dir)
-        meta, sentences = load_meta(meta_path), load_meta(meta_path).get("sentences", [])
+        meta = load_meta(meta_path)
+        sentences = meta.get("sentences", [])
         if not sentences:
             raise ValueError("Document not indexed")
         index = load_index(idx_path)
@@ -137,8 +131,8 @@ class EfficientPDFAnalyzer:
         q_emb = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype("float32")
         k = min(top_k, index.ntotal)
         if k == 0: return []
-        D, I = index.search(q_emb, k)
-        return [(int(idx), float(score), sentences[int(idx)]) for score, idx in zip(D[0], I[0]) if idx != -1 and 0 <= idx < len(sentences)]
+        _, I = index.search(q_emb, k)
+        return [sentences[int(idx)] for idx in I[0] if idx != -1 and 0 <= idx < len(sentences)]
 
     def extractive_summary(self, doc_id: str, num_sentences: int = SUMMARY_SENTENCES) -> str:
         meta_path, _ = meta_paths(doc_id, self.store_dir)
@@ -175,8 +169,8 @@ if "doc_id" in st.session_state:
         try:
             results = analyzer.search(query, st.session_state["doc_id"], top_k=5)
             st.write("### 🔍 Search Results")
-            for idx, score, sentence in results:
-                st.write(f"- **Score:** {score:.4f} | **Sentence:** {sentence}")
+            for sentence in results:
+                st.write(f"- {sentence}")
         except Exception as e:
             st.error(f"Error during search: {e}")
 
