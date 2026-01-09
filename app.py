@@ -8,6 +8,7 @@ from PyPDF2 import PdfReader
 import re
 import streamlit as st
 from typing import List, Dict, Any, Optional
+import time
 
 # -------------------------
 # Config
@@ -41,7 +42,12 @@ def split_sentences(text: str) -> List[str]:
     return [s for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s]
 
 def batch_encode(model, sentences: List[str]) -> np.ndarray:
-    emb = model.encode(sentences, convert_to_numpy=True, normalize_embeddings=True, batch_size=32).astype("float32")
+    emb = model.encode(
+        sentences,
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+        batch_size=32
+    ).astype("float32")
     faiss.normalize_L2(emb)
     return emb
 
@@ -70,7 +76,7 @@ def _maybe_to_gpu(index: faiss.Index) -> faiss.Index:
 
 def build_index(embeddings: np.ndarray) -> faiss.IndexIDMap2:
     dim = embeddings.shape[1]
-    hnsw_index = faiss.IndexHNSWFlat(dim, 32)
+    hnsw_index = faiss.IndexHNSWFlat(dim, 32)  # 32 neighbors
     return faiss.IndexIDMap2(hnsw_index)
 
 def save_index(index: faiss.Index, path: str):
@@ -78,6 +84,106 @@ def save_index(index: faiss.Index, path: str):
 
 def load_index(path: str) -> Optional[faiss.Index]:
     return faiss.read_index(path) if os.path.exists(path) else None
+
+# -------------------------
+# Animations
+# -------------------------
+def shimmer_loader(text="Indexing your PDF..."):
+    st.markdown("""
+    <style>
+    .shimmer {
+        height: 18px;
+        width: 100%;
+        background: linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 37%, #f0f0f0 63%);
+        background-size: 400% 100%;
+        animation: shimmer 1.4s ease-in-out infinite;
+        border-radius: 6px;
+        margin: 8px 0;
+    }
+    @keyframes shimmer {
+        0% { background-position: 100% 0; }
+        100% { background-position: -100% 0; }
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    st.write(text)
+    for _ in range(4):
+        st.markdown('<div class="shimmer"></div>', unsafe_allow_html=True)
+
+def staged_progress(stages):
+    progress = st.progress(0)
+    status = st.empty()
+    for i, (label, delay) in enumerate(stages, start=1):
+        status.markdown(f"**{label}**")
+        progress.progress(int(i / len(stages) * 100))
+        time.sleep(delay)
+    status.markdown("**Done.**")
+
+def typewriter(text, speed=0.02):
+    container = st.empty()
+    out = ""
+    for ch in text:
+        out += ch
+        container.markdown(f"### 🔍 {out}")
+        time.sleep(speed)
+
+def fade_in_list(items):
+    st.markdown("""
+    <style>
+    .fade-item { opacity: 0; transform: translateY(6px); animation: fadeIn 0.35s forwards; }
+    .fade-item:nth-child(1){ animation-delay: 0.05s; }
+    .fade-item:nth-child(2){ animation-delay: 0.10s; }
+    .fade-item:nth-child(3){ animation-delay: 0.15s; }
+    .fade-item:nth-child(4){ animation-delay: 0.20s; }
+    .fade-item:nth-child(5){ animation-delay: 0.25s; }
+    @keyframes fadeIn { to { opacity: 1; transform: translateY(0); } }
+    </style>
+    """, unsafe_allow_html=True)
+    st.markdown("<div>", unsafe_allow_html=True)
+    for s in items:
+        st.markdown(f'<div class="fade-item">- {s}</div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+def pulsing_banner(text="Compiling extractive summary..."):
+    st.markdown("""
+    <style>
+    .pulse {
+        padding: 10px 14px;
+        border-radius: 8px;
+        background: #1f6feb20;
+        border: 1px solid #1f6feb55;
+        display: inline-block;
+        animation: pulse 1.2s ease-in-out infinite;
+    }
+    @keyframes pulse {
+        0% { box-shadow: 0 0 0 0 rgba(31,111,235,0.4); }
+        70% { box-shadow: 0 0 0 10px rgba(31,111,235,0); }
+        100% { box-shadow: 0 0 0 0 rgba(31,111,235,0); }
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    st.markdown(f'<div class="pulse">{text}</div>', unsafe_allow_html=True)
+
+def animated_header(title="📄 Advanced PDF Analyzer (Optimized)"):
+    st.markdown(f"""
+    <style>
+    .grad {{
+        background: linear-gradient(90deg, #0ea5e9, #22c55e, #f59e0b);
+        background-size: 200% 200%;
+        animation: moveGrad 6s ease infinite;
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        font-weight: 700; font-size: 2rem;
+        margin-bottom: 8px;
+    }}
+    @keyframes moveGrad {{
+        0% {{ background-position: 0% 50%; }}
+        50% {{ background-position: 100% 50%; }}
+        100% {{ background-position: 0% 50%; }}
+    }}
+    </style>
+    <div class="grad">{title}</div>
+    """, unsafe_allow_html=True)
 
 # -------------------------
 # Analyzer
@@ -97,7 +203,12 @@ class EfficientPDFAnalyzer:
         if not reindex:
             meta, index = load_meta(meta_path), load_index(idx_path)
             if index is not None and meta.get("sentences"):
-                return {"status": "loaded", "doc_id": doc_id, "count": len(meta["sentences"]), "index_type": meta.get("config", {}).get("index_type", "HNSW")}
+                return {
+                    "status": "loaded",
+                    "doc_id": doc_id,
+                    "count": len(meta["sentences"]),
+                    "index_type": meta.get("config", {}).get("index_type", "HNSW")
+                }
 
         sentences = split_sentences(read_pdf_text(pdf_source))
         if not sentences:
@@ -124,7 +235,7 @@ class EfficientPDFAnalyzer:
             raise ValueError("Index file missing or unreadable")
 
         q_emb = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype("float32")
-        _, I = index.search(q_emb, min(top_k*3, index.ntotal))
+        _, I = index.search(q_emb, min(top_k * 3, index.ntotal))  # get more candidates
 
         candidates = [sentences[int(idx)] for idx in I[0] if idx != -1]
         if not candidates:
@@ -151,47 +262,22 @@ class EfficientPDFAnalyzer:
 # -------------------------
 # Streamlit App
 # -------------------------
-st.title("📄 Advanced PDF Analyzer (Optimized)")
+animated_header("📄 Advanced PDF Analyzer (Optimized)")
 
 analyzer = EfficientPDFAnalyzer()
-
-# Futuristic neon pulse + bouncing dots loader
-loading_html = """
-<style>
-.loader {
-  border: 8px solid #222;
-  border-top: 8px solid #00ffcc;
-  border-radius: 50%;
-  width: 60px;
-  height: 60px;
-  animation: spin 1s linear infinite, glow 1.5s ease-in-out infinite alternate;
-  margin: auto;
-}
-@keyframes spin { 0% { transform: rotate(0deg);} 100% { transform: rotate(360deg);} }
-@keyframes glow { from { box-shadow:0 0 10px #00ffcc;} to { box-shadow:0 0 30px #00ffcc;} }
-
-.dots { display:flex; justify-content:center; margin-top:10px; }
-.dots div {
-  width:12px; height:12px; margin:0 5px; background:#00ffcc; border-radius:50%;
-  animation:bounce 0.6s infinite alternate;
-}
-.dots div:nth-child(2){ animation-delay:0.2s; }
-.dots div:nth-child(3){ animation-delay:0.4s; }
-@keyframes bounce { from { transform:translateY(0);} to { transform:translateY(-15px);} }
-</style>
-<div style="text-align:center;">
-  <div class="loader"></div>
-  <div class="dots"><div></div><div></div><div></div></div>
-  <p><em>Analyzing... please wait</em></p>
-</div>
-"""
 
 uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
 if uploaded_file is not None:
     try:
-        with st.spinner("Indexing PDF..."):
-            st.markdown(loading_html, unsafe_allow_html=True)
-            meta = analyzer.index_pdf(uploaded_file)
+        shimmer_loader("Extracting text and building HNSW index...")
+        staged_progress([
+            ("Reading PDF pages", 0.5),
+            ("Splitting sentences", 0.3),
+            ("Encoding embeddings", 0.7),
+            ("Building HNSW index", 0.6),
+            ("Saving metadata", 0.3),
+        ])
+        meta = analyzer.index_pdf(uploaded_file)
         st.success(f"Indexed {meta['count']} sentences from {uploaded_file.name} (Index type: {meta['index_type']})")
         st.session_state["doc_id"] = meta["doc_id"]
     except Exception as e:
@@ -201,5 +287,17 @@ if "doc_id" in st.session_state:
     query = st.text_input("Enter search query")
     if st.button("Search"):
         try:
-            with st.spinner("Searching..."):
-                st.markdown(loading_html, unsafe_allow
+            typewriter("Search Results")
+            results = analyzer.search(query, st.session_state["doc_id"], top_k=5)
+            fade_in_list(results)
+        except Exception as e:
+            st.error(f"Error during search: {e}")
+
+    if st.button("Generate Summary"):
+        try:
+            pulsing_banner("Compiling extractive summary...")
+            summary_text = analyzer.extractive_summary(st.session_state["doc_id"], num_sentences=SUMMARY_SENTENCES)
+            st.write("### 📌 Extractive Summary")
+            st.write(summary_text)
+        except Exception as e:
+            st.error(f"Error generating summary: {e}")
