@@ -20,13 +20,15 @@ def load_lottie_url(url: str):
     except:
         return None
 
-# Diverse, vibrant Lottie animations (no ice/snow themes)
-WELCOME_ROBOT      = "https://assets5.lottiefiles.com/packages/lf20_kkflmtur.json"  # Friendly robot wave
-INDEXING_DOC       = "https://assets2.lottiefiles.com/packages/lf20_6nfjl2av.json"  # Dynamic document upload
-SEARCHING_GLASS    = "https://assets4.lottiefiles.com/packages/lf20_Uz4uNe.json"   # Magnifying glass search
-FIREWORKS_SUCCESS  = "https://assets10.lottiefiles.com/packages/lf20_towptqfc.json" # Explosive fireworks
-PARTY_POPPER       = "https://assets1.lottiefiles.com/packages/lf20_yM3Lp0P7.json"  # Party popper celebration
-GREEN_CHECKMARK    = "https://assets3.lottiefiles.com/packages/lf20_pBnsC0.json"    # Bold green check
+# More diverse & vibrant Lottie animations (no repetition)
+WELCOME_ROBOT       = "https://assets5.lottiefiles.com/packages/lf20_kkflmtur.json"   # Friendly robot
+DATA_LOADING        = "https://assets6.lottiefiles.com/packages/lf20_afwjvtdp.json"   # Data processing
+ROCKET_INDEX        = "https://assets8.lottiefiles.com/packages/lf20_6nfjl2av.json"   # Rocket upload
+SEARCH_EYE          = "https://assets4.lottiefiles.com/packages/lf20_Uz4uNe.json"     # Searching eye
+FIREWORKS           = "https://assets10.lottiefiles.com/packages/lf20_towptqfc.json"  # Fireworks
+PARTY_POPPER        = "https://assets1.lottiefiles.com/packages/lf20_yM3Lp0P7.json"   # Party popper
+CONFETTI_BURST      = "https://assets9.lottiefiles.com/packages/lf20_jbrw3hcz.json"   # Confetti burst
+THUMBS_UP           = "https://assets2.lottiefiles.com/packages/lf20_oxmdw2.json"     # Thumbs up success
 
 try:
     from streamlit_lottie import st_lottie
@@ -39,24 +41,22 @@ def show_lottie(url: str, height: int = 200, key: str = None):
     if LOTTIE_AVAILABLE and anim:
         st_lottie(anim, height=height, key=key)
     else:
-        # Safe, varied built-in fallbacks (only st.balloons and st.snow exist)
-        if "fireworks" in url or "party" in url or "success" in url:
-            st.balloons()  # Celebratory balloons for successes
-        elif "check" in url:
-            st.success("✓ Completed successfully!")
+        # Varied built-in fallbacks
+        if "rocket" in url or "fireworks" in url or "party" in url or "confetti" in url:
+            st.balloons()
+        elif "thumbs" in url:
+            st.success("✓ Awesome!")
         else:
-            st.balloons()  # Default fun celebration
+            st.snow()  # Light celebration
 
 # ------------------------- Config -------------------------
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 STORE_DIR = "store"
-USE_GPU = True
 SUMMARY_SENTENCES = 5
-HNSW_M = 32
-EF_SEARCH = 64  # Increased for better recall/accuracy during search
+EF_SEARCH = 64  # Good accuracy on CPU
 
-# ------------------------- Helpers -------------------------
+# ------------------------- Helpers (unchanged) -------------------------
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
@@ -95,18 +95,9 @@ def stable_doc_id(name: str) -> str:
     h = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
     return f"{base}-{h}"
 
-def _maybe_to_gpu(index: faiss.Index) -> faiss.Index:
-    if USE_GPU:
-        try:
-            res = faiss.StandardGpuResources()
-            return faiss.index_cpu_to_gpu(res, 0, index)
-        except Exception:
-            return index
-    return index
-
 def build_index(embeddings: np.ndarray) -> faiss.IndexIDMap2:
     dim = embeddings.shape[1]
-    hnsw_index = faiss.IndexHNSWFlat(dim, HNSW_M)
+    hnsw_index = faiss.IndexHNSWFlat(dim, 32)
     hnsw_index.hnsw.efConstruction = 200
     return faiss.IndexIDMap2(hnsw_index)
 
@@ -116,15 +107,27 @@ def save_index(index: faiss.Index, path: str):
 def load_index(path: str) -> Optional[faiss.Index]:
     return faiss.read_index(path) if os.path.exists(path) else None
 
-# ------------------------- Analyzer Class -------------------------
+# ------------------------- Analyzer Class (CPU-only, lazy load) -------------------------
 class EfficientPDFAnalyzer:
     def __init__(self, model_name: str = MODEL_NAME, store_dir: str = STORE_DIR):
-        self.model = SentenceTransformer(model_name)
-        self.reranker = CrossEncoder(RERANK_MODEL)
+        self.model_name = model_name
+        self.rerank_model = RERANK_MODEL
         self.store_dir = store_dir
         ensure_dir(self.store_dir)
+        self.model = None  # Lazy load
+        self.reranker = None  # Lazy load
+
+    def _load_models(self):
+        if self.model is None:
+            with st.spinner("Loading embedding model..."):
+                show_lottie(DATA_LOADING, height=150, key="load_embed")
+                self.model = SentenceTransformer(self.model_name, device="cpu")
+        if self.reranker is None:
+            with st.spinner("Loading reranker model..."):
+                self.reranker = CrossEncoder(self.rerank_model, device="cpu")
 
     def index_pdf(self, pdf_source, doc_id: Optional[str] = None, reindex: bool = False) -> dict:
+        self._load_models()
         inferred_id = stable_doc_id(getattr(pdf_source, "name", "uploaded.pdf"))
         doc_id = doc_id or inferred_id
         meta_path, idx_path = meta_paths(doc_id, self.store_dir)
@@ -133,7 +136,7 @@ class EfficientPDFAnalyzer:
             meta = load_meta(meta_path)
             index = load_index(idx_path)
             if index is not None and meta.get("sentences"):
-                return {"status": "loaded", "doc_id": doc_id, "count": len(meta["sentences"]), "index_type": "HNSW"}
+                return {"status": "loaded", "doc_id": doc_id, "count": len(meta["sentences"])}
 
         sentences = split_sentences(read_pdf_text(pdf_source))
         if not sentences:
@@ -141,15 +144,15 @@ class EfficientPDFAnalyzer:
 
         embeddings = batch_encode(self.model, sentences)
         base_index = build_index(embeddings)
-        index = _maybe_to_gpu(base_index)
         ids = np.arange(len(sentences), dtype="int64")
-        index.add_with_ids(embeddings, ids)
+        base_index.add_with_ids(embeddings, ids)
 
         save_index(base_index, idx_path)
         save_meta(meta_path, sentences, ids.tolist(), {"index_type": "HNSW"})
-        return {"status": "indexed", "doc_id": doc_id, "count": len(sentences), "index_type": "HNSW"}
+        return {"status": "indexed", "doc_id": doc_id, "count": len(sentences)}
 
     def search(self, query: str, doc_id: str, top_k: int = 5) -> List[str]:
+        self._load_models()
         meta_path, idx_path = meta_paths(doc_id, self.store_dir)
         meta = load_meta(meta_path)
         sentences = meta.get("sentences", [])
@@ -160,7 +163,7 @@ class EfficientPDFAnalyzer:
             raise ValueError("Index file missing")
 
         if hasattr(index, 'hnsw'):
-            index.hnsw.efSearch = EF_SEARCH  # Better accuracy
+            index.hnsw.efSearch = EF_SEARCH
 
         q_emb = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype("float32")
         _, I = index.search(q_emb, min(top_k * 3, index.ntotal))
@@ -175,6 +178,7 @@ class EfficientPDFAnalyzer:
         return [sent for sent, _ in ranked[:top_k]]
 
     def extractive_summary(self, doc_id: str, num_sentences: int = SUMMARY_SENTENCES) -> str:
+        self._load_models()
         meta_path, _ = meta_paths(doc_id, self.store_dir)
         meta = load_meta(meta_path)
         sentences = meta.get("sentences", [])
@@ -191,10 +195,9 @@ class EfficientPDFAnalyzer:
         centroid = np.mean(embeddings, axis=0, keepdims=True)
         faiss.normalize_L2(centroid)
 
-        # Improved position bias for better summary quality in PDFs/reports
         positions = np.arange(len(sentences)) / len(sentences)
-        pos_bias = 1.2 - np.abs(positions - 0.1) - np.abs(positions - 0.9)  # Stronger start/end preference
-        pos_bias = np.maximum(pos_bias, 0.8)  # Floor
+        pos_bias = 1.2 - np.abs(positions - 0.1) - np.abs(positions - 0.9)
+        pos_bias = np.maximum(pos_bias, 0.8)
         biased_emb = embeddings * (1 + pos_bias[:, np.newaxis] * 0.3)
 
         tmp = faiss.IndexFlatIP(embeddings.shape[1])
@@ -206,53 +209,54 @@ class EfficientPDFAnalyzer:
 
 # ------------------------- Streamlit App -------------------------
 st.set_page_config(page_title="Advanced PDF Analyzer", layout="centered")
-st.title("📄 Advanced PDF Analyzer – Vibrant Edition!")
+st.title("📄 Advanced PDF Analyzer – Now with More Animations! 🎉")
 
-# Welcome animation (loads instantly)
-show_lottie(WELCOME_ROBOT, height=180, key="welcome")
+show_lottie(WELCOME_ROBOT, height=200, key="welcome")
 
-analyzer = EfficientPDFAnalyzer()
+analyzer = EfficientPDFAnalyzer()  # No heavy load on init
 
 uploaded_file = st.file_uploader("Upload a PDF document", type=["pdf"])
 
 if uploaded_file is not None:
-    with st.spinner("Processing and indexing your PDF..."):
-        show_lottie(INDEXING_DOC, height=200, key="indexing_anim")
+    with st.spinner("Indexing your PDF..."):
+        show_lottie(ROCKET_INDEX, height=250, key="indexing")
         try:
             meta = analyzer.index_pdf(uploaded_file)
-            st.success(f"Successfully indexed {meta['count']} sentences!")
+            st.success(f"Indexed {meta['count']} sentences successfully!")
             st.session_state["doc_id"] = meta["doc_id"]
-            show_lottie(FIREWORKS_SUCCESS, height=300, key="index_success")
+            show_lottie(FIREWORKS, height=300, key="index_fireworks")
+            show_lottie(CONFETTI_BURST, height=250, key="index_confetti")  # Extra animation!
         except Exception as e:
-            st.error(f"Error indexing PDF: {e}")
+            st.error(f"Error: {e}")
 
 if "doc_id" in st.session_state:
     st.markdown("---")
-    query = st.text_input("🔍 Ask a question about the document")
+    query = st.text_input("🔍 Ask anything about the document")
 
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Search Document", use_container_width=True):
-            show_lottie(SEARCHING_GLASS, height=150, key="search_anim")
+            show_lottie(SEARCH_EYE, height=180, key="searching")
             try:
-                results = analyzer.search(query, st.session_state["doc_id"], top_k=5)
+                results = analyzer.search(query, st.session_state["doc_id"])
                 st.markdown("### Search Results")
                 if results:
                     for i, sent in enumerate(results, 1):
                         st.write(f"{i}. {sent}")
-                    show_lottie(GREEN_CHECKMARK, height=100, key="search_done")
+                    show_lottie(THUMBS_UP, height=120, key="search_thumbs")
                 else:
-                    st.info("No relevant sentences found.")
+                    st.info("No matches found.")
             except Exception as e:
                 st.error(f"Search error: {e}")
 
     with col2:
         if st.button("Generate Summary", use_container_width=True):
-            with st.spinner("Creating smarter summary..."):
+            with st.spinner("Generating summary..."):
                 try:
                     summary = analyzer.extractive_summary(st.session_state["doc_id"])
                     st.markdown("### 📌 Extractive Summary")
                     st.write(summary)
-                    show_lottie(PARTY_POPPER, height=300, key="summary_success")
+                    show_lottie(PARTY_POPPER, height=300, key="summary_party")
+                    show_lottie(CONFETTI_BURST, height=250, key="summary_confetti")  # Extra!
                 except Exception as e:
                     st.error(f"Summary error: {e}")
