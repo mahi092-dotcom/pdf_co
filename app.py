@@ -87,7 +87,7 @@ def load_meta(meta_path: str) -> Dict[str, Any]:
 # -------------------------
 # UI Animation Helper
 # -------------------------
-def show_animation(container, lottie_json=None, gif_path=None, height=200):
+def show_animation(container, lottie_json=None, gif_path=None, height=180):
     if LOTTIE_AVAILABLE and lottie_json is not None:
         st_lottie(lottie_json, height=height, key=f"lottie-{id(container)}")
     elif gif_path:
@@ -111,6 +111,7 @@ def batch_encode(model, sentences: List[str], progress_callback=None, chunk_size
         all_embs.append(emb)
         if progress_callback:
             progress_callback(end, total)
+        # tiny sleep only for smoother UI updates; remove in production if desired
         time.sleep(0.01)
     return np.vstack(all_embs)
 
@@ -144,12 +145,23 @@ class EfficientPDFAnalyzer:
         if ui_container:
             progress_bar = ui_container.progress(0)
             anim_slot = ui_container.empty()
+            # show a small animation while encoding (replace gif_path with your file or lottie_json)
+            # show_animation(anim_slot, gif_path="indexing.gif")
 
         def _progress_callback(done, total):
             if progress_bar:
                 progress_bar.progress(min(100, int(done / total * 100)))
 
-        embeddings = batch_encode(self.model, sentences, progress_callback=_progress_callback, chunk_size=128)
+        # show global spinner while encoding (spinner is top-level; animation slot shows visuals)
+        with st.spinner("Encoding document and building index…"):
+            # optional visual snow while indexing
+            if ui_container:
+                st.snow()
+            embeddings = batch_encode(self.model, sentences, progress_callback=_progress_callback, chunk_size=128)
+            if ui_container:
+                # stop snow by clearing the animation slot (snow is global; we just clear any gif)
+                anim_slot.empty()
+
         base_index = build_index(embeddings)
         index = _maybe_to_gpu(base_index)
         ids = np.arange(len(sentences), dtype="int64")
@@ -158,10 +170,11 @@ class EfficientPDFAnalyzer:
         save_index(base_index, idx_path)
         save_meta(meta_path, sentences, ids.tolist(), {"index_type": "HNSW"})
 
-        if anim_slot:
-            anim_slot.empty()
         if progress_bar:
             progress_bar.empty()
+
+        # celebratory animation on success
+        st.balloons()
 
         return {"status": "indexed", "doc_id": doc_id, "count": len(sentences), "index_type": "HNSW"}
 
@@ -175,15 +188,16 @@ class EfficientPDFAnalyzer:
         if index is None:
             raise ValueError("Index file missing or unreadable")
 
-        if ui_container:
-            with ui_container.spinner("Searching…"):
-                anim = ui_container.empty()
-                q_emb = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype("float32")
-                _, I = index.search(q_emb, min(top_k * 3, max(1, index.ntotal)))
-                anim.empty()
-        else:
+        # Use a small animation slot and the top-level spinner
+        anim_slot = ui_container.empty() if ui_container else None
+        with st.spinner("Searching and reranking results…"):
+            if anim_slot:
+                # show_animation(anim_slot, gif_path="searching.gif")
+                pass
             q_emb = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype("float32")
             _, I = index.search(q_emb, min(top_k * 3, max(1, index.ntotal)))
+            if anim_slot:
+                anim_slot.empty()
 
         candidates = [sentences[int(idx)] for idx in I[0] if idx != -1]
         if not candidates:
@@ -200,13 +214,14 @@ class EfficientPDFAnalyzer:
         if not sentences:
             raise ValueError("Document not indexed")
 
-        if ui_container:
-            with ui_container.spinner("Generating summary…"):
-                anim = ui_container.empty()
-                embeddings = batch_encode(self.model, sentences, progress_callback=None, chunk_size=128)
-                anim.empty()
-        else:
+        anim_slot = ui_container.empty() if ui_container else None
+        with st.spinner("Generating extractive summary…"):
+            if anim_slot:
+                # show_animation(anim_slot, gif_path="summarizing.gif")
+                pass
             embeddings = batch_encode(self.model, sentences, progress_callback=None, chunk_size=128)
+            if anim_slot:
+                anim_slot.empty()
 
         centroid = np.mean(embeddings, axis=0, keepdims=True)
         faiss.normalize_L2(centroid)
