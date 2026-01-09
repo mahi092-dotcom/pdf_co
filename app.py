@@ -70,8 +70,7 @@ def _maybe_to_gpu(index: faiss.Index) -> faiss.Index:
 
 def build_index(embeddings: np.ndarray) -> faiss.IndexIDMap2:
     dim = embeddings.shape[1]
-    # Use HNSW for efficient retrieval
-    hnsw_index = faiss.IndexHNSWFlat(dim, 32)  # 32 neighbors
+    hnsw_index = faiss.IndexHNSWFlat(dim, 32)
     return faiss.IndexIDMap2(hnsw_index)
 
 def save_index(index: faiss.Index, path: str):
@@ -125,13 +124,12 @@ class EfficientPDFAnalyzer:
             raise ValueError("Index file missing or unreadable")
 
         q_emb = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype("float32")
-        _, I = index.search(q_emb, min(top_k*3, index.ntotal))  # get more candidates
+        _, I = index.search(q_emb, min(top_k*3, index.ntotal))
 
         candidates = [sentences[int(idx)] for idx in I[0] if idx != -1]
         if not candidates:
             return []
 
-        # Rerank with cross-encoder
         pairs = [(query, cand) for cand in candidates]
         scores = self.reranker.predict(pairs)
         ranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
@@ -157,11 +155,34 @@ st.title("📄 Advanced PDF Analyzer (Optimized)")
 
 analyzer = EfficientPDFAnalyzer()
 
-# PUBG-style loading animation HTML
+# Futuristic neon pulse + bouncing dots loader
 loading_html = """
+<style>
+.loader {
+  border: 8px solid #222;
+  border-top: 8px solid #00ffcc;
+  border-radius: 50%;
+  width: 60px;
+  height: 60px;
+  animation: spin 1s linear infinite, glow 1.5s ease-in-out infinite alternate;
+  margin: auto;
+}
+@keyframes spin { 0% { transform: rotate(0deg);} 100% { transform: rotate(360deg);} }
+@keyframes glow { from { box-shadow:0 0 10px #00ffcc;} to { box-shadow:0 0 30px #00ffcc;} }
+
+.dots { display:flex; justify-content:center; margin-top:10px; }
+.dots div {
+  width:12px; height:12px; margin:0 5px; background:#00ffcc; border-radius:50%;
+  animation:bounce 0.6s infinite alternate;
+}
+.dots div:nth-child(2){ animation-delay:0.2s; }
+.dots div:nth-child(3){ animation-delay:0.4s; }
+@keyframes bounce { from { transform:translateY(0);} to { transform:translateY(-15px);} }
+</style>
 <div style="text-align:center;">
-    <img src="assets/pubg_loader.gif" alt="Loading..." width="150">
-    <p><em>Boots pounding, battle begins...</em></p>
+  <div class="loader"></div>
+  <div class="dots"><div></div><div></div><div></div></div>
+  <p><em>Analyzing... please wait</em></p>
 </div>
 """
 
@@ -181,20 +202,4 @@ if "doc_id" in st.session_state:
     if st.button("Search"):
         try:
             with st.spinner("Searching..."):
-                st.markdown(loading_html, unsafe_allow_html=True)
-                results = analyzer.search(query, st.session_state["doc_id"], top_k=5)
-            st.write("### 🔍 Search Results")
-            for sentence in results:
-                st.write(f"- {sentence}")
-        except Exception as e:
-            st.error(f"Error during search: {e}")
-
-    if st.button("Generate Summary"):
-        try:
-            with st.spinner("Generating summary..."):
-                st.markdown(loading_html, unsafe_allow_html=True)
-                summary_text = analyzer.extractive_summary(st.session_state["doc_id"], num_sentences=SUMMARY_SENTENCES)
-            st.write("### 📌 Extractive Summary")
-            st.write(summary_text)
-        except Exception as e:
-            st.error(f"Error generating summary: {e}")
+                st.markdown(loading_html, unsafe_allow
