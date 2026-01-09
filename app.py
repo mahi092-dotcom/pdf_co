@@ -1,239 +1,262 @@
 import os
 import json
 import hashlib
-import re
-from typing import List, Dict, Any
+import time
+from math import ceil
+from typing import List, Dict, Any, Optional
 
 import numpy as np
 import faiss
-import streamlit as st
-import torch
-from PyPDF2 import PdfReader
 from sentence_transformers import SentenceTransformer, CrossEncoder
+from PyPDF2 import PdfReader
+import re
+import streamlit as st
 
-# =========================
-# Config (AUTO GPU SAFE)
-# =========================
+# Optional Lottie support
+try:
+    from streamlit_lottie import st_lottie
+    LOTTIE_AVAILABLE = True
+except Exception:
+    LOTTIE_AVAILABLE = False
+
+# -------------------------
+# Config
+# -------------------------
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 STORE_DIR = "store"
+USE_GPU = True
 SUMMARY_SENTENCES = 5
-CHUNK_SIZE = 4
-CHUNK_STRIDE = 2
 
-USE_GPU = torch.cuda.is_available()
-DEVICE = "cuda" if USE_GPU else "cpu"
-
-# =========================
+# -------------------------
 # Helpers
-# =========================
+# -------------------------
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
-
 def atomic_write_json(path: str, data: Dict[str, Any]):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
+    os.replace(tmp_path, path)
 
+def meta_paths(doc_id: str, store_dir: str):
+    return os.path.join(store_dir, f"{doc_id}.meta.json"), os.path.join(store_dir, f"{doc_id}.index")
 
-def meta_paths(doc_id: str):
-    return (
-        os.path.join(STORE_DIR, f"{doc_id}.meta.json"),
-        os.path.join(STORE_DIR, f"{doc_id}.index"),
-    )
+def read_pdf_text(pdf_source) -> str:
+    reader = PdfReader(pdf_source)
+    return "\n".join(page.extract_text() or "" for page in reader.pages)
 
+def split_sentences(text: str) -> List[str]:
+    return [s for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s]
 
 def stable_doc_id(name: str) -> str:
     base = os.path.splitext(os.path.basename(name))[0]
     h = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
     return f"{base}-{h}"
 
-
-def read_pdf_text(pdf_source) -> str:
-    pdf_source.seek(0)
-    reader = PdfReader(pdf_source)
-    text = " ".join(page.extract_text() or "" for page in reader.pages)
-    return re.sub(r"\s+", " ", text)
-
-
-def split_sentences(text: str) -> List[str]:
-    return [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if len(s.strip()) > 20]
-
-
-def chunk_sentences(sentences: List[str]) -> List[str]:
-    chunks = []
-    for i in range(0, len(sentences) - CHUNK_SIZE + 1, CHUNK_STRIDE):
-        chunks.append(" ".join(sentences[i:i + CHUNK_SIZE]))
-    return chunks
-
-
-def embed(model, texts: List[str]) -> np.ndarray:
-    emb = model.encode(texts, convert_to_numpy=True).astype("float32")
-    faiss.normalize_L2(emb)
-    return emb
-
-
-def maybe_gpu(index: faiss.Index) -> faiss.Index:
-    if USE_GPU and faiss.get_num_gpus() > 0:
+def _maybe_to_gpu(index: faiss.Index) -> faiss.Index:
+    if USE_GPU:
         try:
             res = faiss.StandardGpuResources()
             return faiss.index_cpu_to_gpu(res, 0, index)
         except Exception:
-            pass
+            return index
     return index
 
+def build_index(embeddings: np.ndarray) -> faiss.IndexIDMap2:
+    dim = embeddings.shape[1]
+    hnsw_index = faiss.IndexHNSWFlat(dim, 32)
+    return faiss.IndexIDMap2(hnsw_index)
 
-def build_index(dim: int) -> faiss.Index:
-    return faiss.IndexIDMap2(faiss.IndexHNSWFlat(dim, 32))
+def save_index(index: faiss.Index, path: str):
+    faiss.write_index(index, path)
 
+def load_index(path: str) -> Optional[faiss.Index]:
+    return faiss.read_index(path) if os.path.exists(path) else None
 
-# =========================
+def save_meta(meta_path: str, sentences: List[str], ids: List[int], config: Dict[str, Any]):
+    atomic_write_json(meta_path, {"sentences": sentences, "ids": ids, "config": config})
+
+def load_meta(meta_path: str) -> Dict[str, Any]:
+    if not os.path.exists(meta_path):
+        return {}
+    with open(meta_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+# -------------------------
+# UI Animation Helper
+# -------------------------
+def show_animation(container, lottie_json=None, gif_path=None, height=200):
+    if LOTTIE_AVAILABLE and lottie_json is not None:
+        st_lottie(lottie_json, height=height, key=f"lottie-{id(container)}")
+    elif gif_path:
+        container.image(gif_path, use_column_width=False, width=height)
+
+# -------------------------
+# Chunked encoder with progress callback
+# -------------------------
+def batch_encode(model, sentences: List[str], progress_callback=None, chunk_size: int = 128) -> np.ndarray:
+    all_embs = []
+    total = len(sentences)
+    if total == 0:
+        return np.zeros((0, model.get_sentence_embedding_dimension()), dtype="float32")
+    chunks = ceil(total / chunk_size)
+    for i in range(chunks):
+        start = i * chunk_size
+        end = min(start + chunk_size, total)
+        chunk = sentences[start:end]
+        emb = model.encode(chunk, convert_to_numpy=True, normalize_embeddings=True, batch_size=32).astype("float32")
+        faiss.normalize_L2(emb)
+        all_embs.append(emb)
+        if progress_callback:
+            progress_callback(end, total)
+        time.sleep(0.01)
+    return np.vstack(all_embs)
+
+# -------------------------
 # Analyzer
-# =========================
+# -------------------------
 class EfficientPDFAnalyzer:
-    def __init__(self):
-        self.model = SentenceTransformer(MODEL_NAME, device=DEVICE)
-        self.reranker = CrossEncoder(RERANK_MODEL, device=DEVICE)
-        ensure_dir(STORE_DIR)
+    def __init__(self, model_name: str = MODEL_NAME, store_dir: str = STORE_DIR):
+        self.model = SentenceTransformer(model_name)
+        self.reranker = CrossEncoder(RERANK_MODEL)
+        self.store_dir = store_dir
+        ensure_dir(self.store_dir)
 
-    def index_pdf(self, pdf_source) -> Dict[str, Any]:
-        doc_id = stable_doc_id(getattr(pdf_source, "name", "uploaded.pdf"))
-        meta_path, idx_path = meta_paths(doc_id)
+    def index_pdf(self, pdf_source, doc_id: Optional[str] = None, reindex: bool = False, ui_container=None) -> dict:
+        inferred_id = stable_doc_id(getattr(pdf_source, "name", "uploaded.pdf"))
+        doc_id = doc_id or inferred_id
+        meta_path, idx_path = meta_paths(doc_id, self.store_dir)
 
-        if os.path.exists(meta_path) and os.path.exists(idx_path):
-            meta = json.load(open(meta_path, "r", encoding="utf-8"))
-            return {"status": "loaded", "doc_id": doc_id, "count": len(meta["chunks"])}
+        if not reindex:
+            meta, index = load_meta(meta_path), load_index(idx_path)
+            if index is not None and meta.get("sentences"):
+                return {"status": "loaded", "doc_id": doc_id, "count": len(meta["sentences"]), "index_type": meta.get("config", {}).get("index_type", "HNSW")}
 
-        with st.spinner("📄 Reading PDF..."):
-            text = read_pdf_text(pdf_source)
-            sentences = split_sentences(text)
-            chunks = chunk_sentences(sentences)
+        text = read_pdf_text(pdf_source)
+        sentences = split_sentences(text)
+        if not sentences:
+            raise ValueError("No readable sentences extracted")
 
-        with st.spinner("🧠 Generating embeddings..."):
-            embeddings = embed(self.model, chunks)
+        progress_bar = None
+        anim_slot = None
+        if ui_container:
+            progress_bar = ui_container.progress(0)
+            anim_slot = ui_container.empty()
 
-        with st.spinner("📦 Building FAISS index..."):
-            index = build_index(embeddings.shape[1])
-            ids = np.arange(len(chunks)).astype("int64")
-            index.add_with_ids(embeddings, ids)
-            faiss.write_index(index, idx_path)
+        def _progress_callback(done, total):
+            if progress_bar:
+                progress_bar.progress(min(100, int(done / total * 100)))
 
-        atomic_write_json(meta_path, {
-            "chunks": chunks,
-            "sentences": sentences,
-            "config": {
-                "chunk_size": CHUNK_SIZE,
-                "stride": CHUNK_STRIDE,
-                "device": DEVICE,
-            }
-        })
+        embeddings = batch_encode(self.model, sentences, progress_callback=_progress_callback, chunk_size=128)
+        base_index = build_index(embeddings)
+        index = _maybe_to_gpu(base_index)
+        ids = np.arange(len(sentences), dtype="int64")
+        index.add_with_ids(embeddings, ids)
 
-        return {"status": "indexed", "doc_id": doc_id, "count": len(chunks)}
+        save_index(base_index, idx_path)
+        save_meta(meta_path, sentences, ids.tolist(), {"index_type": "HNSW"})
 
-    def search(self, query: str, doc_id: str, top_k: int = 5) -> List[str]:
-        meta_path, idx_path = meta_paths(doc_id)
-        meta = json.load(open(meta_path, "r", encoding="utf-8"))
-        chunks = meta["chunks"]
+        if anim_slot:
+            anim_slot.empty()
+        if progress_bar:
+            progress_bar.empty()
 
-        index = maybe_gpu(faiss.read_index(idx_path))
-        q_emb = embed(self.model, [query])
+        return {"status": "indexed", "doc_id": doc_id, "count": len(sentences), "index_type": "HNSW"}
 
-        with st.spinner("🔍 Retrieving candidates..."):
-            _, I = index.search(q_emb, min(top_k * 4, index.ntotal))
-            candidates = [chunks[i] for i in I[0] if i != -1]
+    def search(self, query: str, doc_id: str, top_k: int = 3, ui_container=None) -> List[str]:
+        meta_path, idx_path = meta_paths(doc_id, self.store_dir)
+        meta = load_meta(meta_path)
+        sentences = meta.get("sentences", [])
+        if not sentences:
+            raise ValueError("Document not indexed")
+        index = load_index(idx_path)
+        if index is None:
+            raise ValueError("Index file missing or unreadable")
 
-        with st.spinner("🎯 Reranking results..."):
-            scores = self.reranker.predict([(query, c) for c in candidates])
-            ranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
-
-        return [c for c, _ in ranked[:top_k]]
-
-    def extractive_summary(self, doc_id: str, k: int) -> str:
-        meta_path, _ = meta_paths(doc_id)
-        sentences = json.load(open(meta_path, "r", encoding="utf-8"))["sentences"]
-        emb = embed(self.model, sentences)
-
-        centroid = emb.mean(axis=0, keepdims=True)
-        faiss.normalize_L2(centroid)
-        idx = faiss.IndexFlatIP(emb.shape[1])
-        idx.add(emb)
-        _, I = idx.search(centroid, min(k, len(sentences)))
-        return " ".join(sentences[i] for i in I[0])
-
-
-# =========================
-# Streamlit UI (Animated + Lottie)
-# =========================
-st.set_page_config(page_title="Advanced PDF Analyzer", layout="wide")
-st.title("📄 Advanced PDF Analyzer")
-st.caption(f"⚙️ Running on {'GPU' if USE_GPU else 'CPU'} | FAISS + Transformers")
-
-# ---- Optional Lottie Support (safe fallback) ----
-try:
-    from streamlit_lottie import st_lottie
-    import requests
-
-    def load_lottie(url: str):
-        r = requests.get(url, timeout=5)
-        return r.json() if r.status_code == 200 else None
-
-    LOTTIE_AVAILABLE = True
-except Exception:
-    LOTTIE_AVAILABLE = False
-
-LOTTIE_LOADING = (
-    load_lottie("https://assets2.lottiefiles.com/packages/lf20_usmfx6bp.json")
-    if LOTTIE_AVAILABLE else None
-)
-
-@st.cache_resource
-def get_analyzer():
-    return EfficientPDFAnalyzer()
-
-analyzer = get_analyzer()
-
-uploaded = st.file_uploader("Upload a PDF", type=["pdf"])
-
-if uploaded:
-    col_anim, col_main = st.columns([1, 3])
-
-    with col_anim:
-        if LOTTIE_AVAILABLE and LOTTIE_LOADING:
-            st_lottie(LOTTIE_LOADING, height=200, key="upload")
+        if ui_container:
+            with ui_container.spinner("Searching…"):
+                anim = ui_container.empty()
+                q_emb = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype("float32")
+                _, I = index.search(q_emb, min(top_k * 3, max(1, index.ntotal)))
+                anim.empty()
         else:
-            st.markdown("⏳ Indexing...")
+            q_emb = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype("float32")
+            _, I = index.search(q_emb, min(top_k * 3, max(1, index.ntotal)))
 
-    with col_main:
-        progress = st.progress(0)
-        progress.progress(15)
-        meta = analyzer.index_pdf(uploaded)
-        progress.progress(100)
-        st.success(f"✅ Indexed {meta['count']} chunks")
+        candidates = [sentences[int(idx)] for idx in I[0] if idx != -1]
+        if not candidates:
+            return []
+
+        pairs = [(query, cand) for cand in candidates]
+        scores = self.reranker.predict(pairs)
+        ranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
+        return [sent for sent, _ in ranked[:top_k]]
+
+    def extractive_summary(self, doc_id: str, num_sentences: int = SUMMARY_SENTENCES, ui_container=None) -> str:
+        meta_path, _ = meta_paths(doc_id, self.store_dir)
+        sentences = load_meta(meta_path).get("sentences", [])
+        if not sentences:
+            raise ValueError("Document not indexed")
+
+        if ui_container:
+            with ui_container.spinner("Generating summary…"):
+                anim = ui_container.empty()
+                embeddings = batch_encode(self.model, sentences, progress_callback=None, chunk_size=128)
+                anim.empty()
+        else:
+            embeddings = batch_encode(self.model, sentences, progress_callback=None, chunk_size=128)
+
+        centroid = np.mean(embeddings, axis=0, keepdims=True)
+        faiss.normalize_L2(centroid)
+        tmp = faiss.IndexFlatIP(embeddings.shape[1])
+        tmp.add(embeddings)
+        _, I = tmp.search(centroid, min(num_sentences, len(sentences)))
+        return " ".join(sentences[int(i)] for i in I[0])
+
+# -------------------------
+# Streamlit App
+# -------------------------
+st.set_page_config(page_title="Advanced PDF Analyzer", layout="wide")
+st.title("📄 Advanced PDF Analyzer (Optimized)")
+
+analyzer = EfficientPDFAnalyzer()
+
+uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
+if uploaded_file is not None:
+    try:
+        ui = st.empty()
+        with ui.container():
+            st.write("Indexing document. This may take a moment.")
+            meta = analyzer.index_pdf(uploaded_file, ui_container=ui)
+        st.success(f"Indexed {meta['count']} sentences from {uploaded_file.name} (Index type: {meta['index_type']})")
         st.session_state["doc_id"] = meta["doc_id"]
+    except Exception as e:
+        st.error(f"Error indexing PDF: {e}")
 
 if "doc_id" in st.session_state:
-    st.divider()
-    query = st.text_input("Ask a question about the document")
+    query = st.text_input("Enter search query")
+    if st.button("Search"):
+        try:
+            ui = st.empty()
+            with ui.container():
+                results = analyzer.search(query, st.session_state["doc_id"], top_k=5, ui_container=ui)
+            st.write("### 🔍 Search Results")
+            if results:
+                for sentence in results:
+                    st.write(f"- {sentence}")
+            else:
+                st.write("No relevant results found.")
+        except Exception as e:
+            st.error(f"Error during search: {e}")
 
-    col1, col2 = st.columns(2)
-
-    with col1:
-        if st.button("🔍 Search"):
-            anim_slot = st.empty()
-            if LOTTIE_AVAILABLE and LOTTIE_LOADING:
-                anim_slot.lottie(LOTTIE_LOADING, height=150, key="search")
-            results = analyzer.search(query, st.session_state["doc_id"])
-            anim_slot.empty()
-            for r in results:
-                st.markdown(f"- {r}")
-
-    with col2:
-        if st.button("📌 Generate Summary"):
-            anim_slot = st.empty()
-            if LOTTIE_AVAILABLE and LOTTIE_LOADING:
-                anim_slot.lottie(LOTTIE_LOADING, height=150, key="summary")
-            summary = analyzer.extractive_summary(st.session_state["doc_id"], SUMMARY_SENTENCES)
-            anim_slot.empty()
-            st.info(summary)
+    if st.button("Generate Summary"):
+        try:
+            ui = st.empty()
+            with ui.container():
+                summary_text = analyzer.extractive_summary(st.session_state["doc_id"], num_sentences=SUMMARY_SENTENCES, ui_container=ui)
+            st.write("### 📌 Extractive Summary")
+            st.write(summary_text)
+        except Exception as e:
+            st.error(f"Error generating summary: {e}")
