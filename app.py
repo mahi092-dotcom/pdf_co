@@ -8,32 +8,44 @@ from PyPDF2 import PdfReader
 import re
 import streamlit as st
 from typing import List, Dict, Any, Optional
-import requests  # Added for loading Lottie animations
+import requests
 
-# ------------------------- New: Animation Helpers -------------------------
+# ------------------------- Animation Setup -------------------------
 def load_lottie_url(url: str):
-    """Load Lottie animation JSON from a URL."""
     try:
-        r = requests.get(url)
-        if r.status_code != 200:
-            return None
-        return r.json()
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+        return None
     except:
         return None
 
-# Lottie URLs (free from LottieFiles)
-SUCCESS_ANIMATION_URL = "https://assets9.lottiefiles.com/packages/lf20_jbrw3hcz.json"  # Confetti success animation
-INDEXING_ANIMATION_URL = "https://assets8.lottiefiles.com/packages/lf20_x62chJ.json"  # Document processing animation
-SEARCH_ANIMATION_URL = "https://assets4.lottiefiles.com/packages/lf20_Uz4uNe.json"  # Magnifying glass search animation
+# Lottie animation URLs (free from LottieFiles)
+SUCCESS_CONFETTI = "https://assets9.lottiefiles.com/packages/lf20_jbrw3hcz.json"  # Confetti
+INDEXING_DOC = "https://assets8.lottiefiles.com/packages/lf20_x62chJ.json"       # Document processing
+SEARCHING = "https://assets4.lottiefiles.com/packages/lf20_Uz4uNe.json"          # Magnifying glass
+WELCOME = "https://assets5.lottiefiles.com/packages/lf20_V9t630.json"            # Hello wave
+CHECKMARK = "https://assets3.lottiefiles.com/packages/lf20_pBnsC0.json"         # Success check
 
-# Install note (you need to run this once in your environment):
-# pip install streamlit-lottie
-
+# Try to import streamlit-lottie; fallback if not available
 try:
     from streamlit_lottie import st_lottie
+    LOTTIE_AVAILABLE = True
 except ImportError:
-    st.error("Please install streamlit-lottie: `pip install streamlit-lottie`")
-    st.stop()
+    LOTTIE_AVAILABLE = False
+
+def show_lottie(url: str, height: int = 200, key: str = None):
+    anim = load_lottie_url(url)
+    if LOTTIE_AVAILABLE and anim:
+        st_lottie(anim, height=height, key=key)
+    else:
+        # Graceful fallback
+        if "confetti" in url or "check" in url:
+            st.balloons() if "confetti" in url else st.success("✓ Done!")
+        elif "search" in url.lower():
+            st.spinner("Searching...")
+        else:
+            st.snow()  # Fun fallback for any animation
 
 # ------------------------- Config -------------------------
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
@@ -92,7 +104,7 @@ def _maybe_to_gpu(index: faiss.Index) -> faiss.Index:
 
 def build_index(embeddings: np.ndarray) -> faiss.IndexIDMap2:
     dim = embeddings.shape[1]
-    hnsw_index = faiss.IndexHNSWFlat(dim, 32)  # 32 neighbors
+    hnsw_index = faiss.IndexHNSWFlat(dim, 32)
     return faiss.IndexIDMap2(hnsw_index)
 
 def save_index(index: faiss.Index, path: str):
@@ -101,7 +113,7 @@ def save_index(index: faiss.Index, path: str):
 def load_index(path: str) -> Optional[faiss.Index]:
     return faiss.read_index(path) if os.path.exists(path) else None
 
-# ------------------------- Analyzer -------------------------
+# ------------------------- Analyzer Class -------------------------
 class EfficientPDFAnalyzer:
     def __init__(self, model_name: str = MODEL_NAME, store_dir: str = STORE_DIR):
         self.model = SentenceTransformer(model_name)
@@ -115,9 +127,10 @@ class EfficientPDFAnalyzer:
         meta_path, idx_path = meta_paths(doc_id, self.store_dir)
 
         if not reindex:
-            meta, index = load_meta(meta_path), load_index(idx_path)
+            meta = load_meta(meta_path)
+            index = load_index(idx_path)
             if index is not None and meta.get("sentences"):
-                return {"status": "loaded", "doc_id": doc_id, "count": len(meta["sentences"]), "index_type": meta.get("config", {}).get("index_type", "HNSW")}
+                return {"status": "loaded", "doc_id": doc_id, "count": len(meta["sentences"]), "index_type": "HNSW"}
 
         sentences = split_sentences(read_pdf_text(pdf_source))
         if not sentences:
@@ -133,7 +146,7 @@ class EfficientPDFAnalyzer:
         save_meta(meta_path, sentences, ids.tolist(), {"index_type": "HNSW"})
         return {"status": "indexed", "doc_id": doc_id, "count": len(sentences), "index_type": "HNSW"}
 
-    def search(self, query: str, doc_id: str, top_k: int = 3) -> List[str]:
+    def search(self, query: str, doc_id: str, top_k: int = 5) -> List[str]:
         meta_path, idx_path = meta_paths(doc_id, self.store_dir)
         meta = load_meta(meta_path)
         sentences = meta.get("sentences", [])
@@ -141,16 +154,15 @@ class EfficientPDFAnalyzer:
             raise ValueError("Document not indexed")
         index = load_index(idx_path)
         if index is None:
-            raise ValueError("Index file missing or unreadable")
+            raise ValueError("Index file missing")
 
         q_emb = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype("float32")
-        _, I = index.search(q_emb, min(top_k*3, index.ntotal))  # get more candidates
+        _, I = index.search(q_emb, min(top_k * 3, index.ntotal))
 
         candidates = [sentences[int(idx)] for idx in I[0] if idx != -1]
         if not candidates:
             return []
 
-        # Rerank with cross-encoder
         pairs = [(query, cand) for cand in candidates]
         scores = self.reranker.predict(pairs)
         ranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
@@ -170,63 +182,54 @@ class EfficientPDFAnalyzer:
         return " ".join(sentences[int(i)] for i in I[0])
 
 # ------------------------- Streamlit App -------------------------
-st.title("📄 Advanced PDF Analyzer (with Animations!)")
+st.set_page_config(page_title="Advanced PDF Analyzer", layout="centered")
+st.title("📄 Advanced PDF Analyzer with Animations")
+
+# Welcome animation
+show_lottie(WELCOME, height=180, key="welcome")
 
 analyzer = EfficientPDFAnalyzer()
 
-# Header animation (subtle welcome)
-hello_anim = load_lottie_url("https://assets5.lottiefiles.com/packages/lf20_V9t630.json")  # Hello wave
-if hello_anim:
-    st_lottie(hello_anim, height=200, key="hello")
+uploaded_file = st.file_uploader("Upload a PDF document", type=["pdf"])
 
-uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
 if uploaded_file is not None:
-    with st.spinner("Indexing PDF..."):
-        indexing_anim = load_lottie_url(INDEXING_ANIMATION_URL)
-        if indexing_anim:
-            st_lottie(indexing_anim, height=200, key="indexing")
+    with st.spinner("Processing and indexing your PDF..."):
+        show_lottie(INDEXING_DOC, height=200, key="indexing_anim")
         try:
             meta = analyzer.index_pdf(uploaded_file)
-            st.success(f"Indexed {meta['count']} sentences from {uploaded_file.name} (Index type: {meta['index_type']})")
+            st.success(f"Successfully indexed {meta['count']} sentences!")
             st.session_state["doc_id"] = meta["doc_id"]
-
-            # Success confetti animation instead of balloons
-            success_anim = load_lottie_url(SUCCESS_ANIMATION_URL)
-            if success_anim:
-                st_lottie(success_anim, height=300, key="success_confetti")
+            show_lottie(SUCCESS_CONFETTI, height=300, key="index_success")
         except Exception as e:
             st.error(f"Error indexing PDF: {e}")
 
 if "doc_id" in st.session_state:
-    query = st.text_input("Enter search query")
-    if st.button("Search"):
-        search_anim = load_lottie_url(SEARCH_ANIMATION_URL)
-        if search_anim:
-            st_lottie(search_anim, height=150, key="searching")
-        try:
-            results = analyzer.search(query, st.session_state["doc_id"], top_k=5)
-            st.write("### 🔍 Search Results")
-            for sentence in results:
-                st.write(f"- {sentence}")
+    st.markdown("---")
+    query = st.text_input("🔍 Ask a question about the document")
 
-            # Optional: small success after search
-            if results:
-                small_success = load_lottie_url("https://assets3.lottiefiles.com/packages/lf20_pBnsC0.json")  # Checkmark
-                if small_success:
-                    st_lottie(small_success, height=100, key="search_done")
-        except Exception as e:
-            st.error(f"Error during search: {e}")
-
-    if st.button("Generate Summary"):
-        with st.spinner("Generating summary..."):
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Search Document", use_container_width=True):
+            show_lottie(SEARCHING, height=150, key="search_anim")
             try:
-                summary_text = analyzer.extractive_summary(st.session_state["doc_id"], num_sentences=SUMMARY_SENTENCES)
-                st.write("### 📌 Extractive Summary")
-                st.write(summary_text)
-
-                # Celebration for summary
-                summary_success = load_lottie_url(SUCCESS_ANIMATION_URL)
-                if summary_success:
-                    st_lottie(summary_success, height=300, key="summary_confetti")
+                results = analyzer.search(query, st.session_state["doc_id"], top_k=5)
+                st.markdown("### Search Results")
+                if results:
+                    for i, sent in enumerate(results, 1):
+                        st.write(f"{i}. {sent}")
+                    show_lottie(CHECKMARK, height=100, key="search_done")
+                else:
+                    st.info("No relevant sentences found.")
             except Exception as e:
-                st.error(f"Error generating summary: {e}")
+                st.error(f"Search error: {e}")
+
+    with col2:
+        if st.button("Generate Summary", use_container_width=True):
+            with st.spinner("Creating extractive summary..."):
+                try:
+                    summary = analyzer.extractive_summary(st.session_state["doc_id"])
+                    st.markdown("### 📌 Extractive Summary")
+                    st.write(summary)
+                    show_lottie(SUCCESS_CONFETTI, height=300, key="summary_success")
+                except Exception as e:
+                    st.error(f"Summary error: {e}")
