@@ -1,9 +1,13 @@
 """
-Advanced PDF Analyzer - Single-file Streamlit app
+Advanced PDF Analyzer - Single-file Streamlit app (fixed)
+Fixes the AttributeError caused by using Streamlit's experimental decorator
+on an instance method. This version uses a simple on-disk embedding cache
+to avoid Streamlit decorator issues and to be safe for background threads.
+
 Features:
 - Background indexing with progress callbacks and staged Lottie animations
 - HNSW index with tuned parameters and saved meta
-- Embedding caching with st.experimental_memo
+- On-disk embedding caching (safe for threads)
 - Batched reranker scoring and limited candidate reranking
 - Extractive summary using centroid + positional bias
 - Responsive UI with progress bar, placeholders, and multiple animations
@@ -17,10 +21,9 @@ Notes:
 import os
 import json
 import tempfile
-import threading
 import concurrent.futures
 from typing import List, Tuple, Dict, Any
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 
 import numpy as np
 import faiss
@@ -78,6 +81,9 @@ def load_index(path: str) -> faiss.Index:
     if not os.path.exists(path):
         return None
     return faiss.read_index(path)
+
+def embeddings_cache_path(doc_id: str) -> str:
+    return os.path.join(STORE_DIR, f"{doc_id}.embeddings.npy")
 
 # -------------------------
 # Placeholder implementations
@@ -150,6 +156,53 @@ def show_lottie(lottie_obj, height=200, key=None):
     return st.empty()
 
 # -------------------------
+# Embedding cache (on-disk)
+# -------------------------
+def get_or_compute_embeddings_on_disk(doc_id: str, sentences: List[str], model: DummyModel) -> np.ndarray:
+    """
+    Thread-safe on-disk cache for embeddings.
+    - If cache exists, load and return.
+    - Otherwise compute embeddings in batches, normalize, save to .npy, and return.
+    """
+    cache_path = embeddings_cache_path(doc_id)
+    if os.path.exists(cache_path):
+        try:
+            emb = np.load(cache_path)
+            # ensure dtype float32
+            if emb.dtype != np.float32:
+                emb = emb.astype("float32")
+            return emb
+        except Exception:
+            # corrupted cache: remove and recompute
+            try:
+                os.remove(cache_path)
+            except Exception:
+                pass
+
+    # compute embeddings in batches
+    all_embs = []
+    for i in range(0, len(sentences), BATCH_ENCODE_SIZE):
+        batch = sentences[i : i + BATCH_ENCODE_SIZE]
+        emb = model.encode(batch, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
+        all_embs.append(emb)
+    embeddings = np.vstack(all_embs)
+    # normalize to unit length
+    faiss.normalize_L2(embeddings)
+    # save atomically
+    tmp_path = cache_path + ".tmp"
+    try:
+        np.save(tmp_path, embeddings)
+        os.replace(tmp_path, cache_path)
+    except Exception:
+        # best-effort save; ignore failures
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+    return embeddings
+
+# -------------------------
 # EfficientPDFAnalyzer
 # -------------------------
 class EfficientPDFAnalyzer:
@@ -168,23 +221,6 @@ class EfficientPDFAnalyzer:
         self.model = DummyModel(dim=384)
         self.reranker = DummyReranker()
         self._models_loaded = True
-
-    @st.experimental_memo(show_spinner=False)
-    def _cached_embeddings(self, doc_id: str, sentences: Tuple[str, ...]) -> np.ndarray:
-        """
-        Cache embeddings per doc_id + sentences tuple. Streamlit will invalidate when code changes.
-        """
-        self._load_models()
-        # batch encode to avoid memory spikes
-        all_embs = []
-        for i in range(0, len(sentences), BATCH_ENCODE_SIZE):
-            batch = list(sentences[i : i + BATCH_ENCODE_SIZE])
-            emb = self.model.encode(batch, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
-            all_embs.append(emb)
-        embeddings = np.vstack(all_embs)
-        # ensure normalized
-        faiss.normalize_L2(embeddings)
-        return embeddings
 
     def index_pdf(self, pdf_source, doc_id: str = None, reindex: bool = False, progress_callback=None) -> Dict[str, Any]:
         """
@@ -216,8 +252,8 @@ class EfficientPDFAnalyzer:
 
         if progress_callback:
             progress_callback(30, "Computing embeddings")
-        # Use cached embeddings function (memoized)
-        embeddings = self._cached_embeddings(doc_id, tuple(sentences))
+        # Use on-disk cached embeddings (thread-safe)
+        embeddings = get_or_compute_embeddings_on_disk(doc_id, sentences, self.model)
 
         if progress_callback:
             progress_callback(60, "Building HNSW index")
@@ -288,8 +324,8 @@ class EfficientPDFAnalyzer:
         if not sentences:
             raise ValueError("Document not indexed")
 
-        # get cached embeddings
-        embeddings = self._cached_embeddings(doc_id, tuple(sentences))
+        # get cached embeddings from disk
+        embeddings = get_or_compute_embeddings_on_disk(doc_id, sentences, self.model)
         # centroid
         centroid = np.mean(embeddings, axis=0, keepdims=True).astype("float32")
         faiss.normalize_L2(centroid)
@@ -330,8 +366,7 @@ lottie_slot = st.empty()
 def ui_progress_callback(pct: int, msg: str):
     """
     UI callback used by background indexing to update progress bar and animations.
-    This function is thread-safe because Streamlit's widgets must be updated from main thread.
-    We'll store progress in session_state and let the main thread render it.
+    We store progress in session_state and let the main thread render it.
     """
     st.session_state["_index_progress"] = {"pct": int(pct), "msg": msg}
 
@@ -357,8 +392,9 @@ if uploaded_file is not None:
         show_lottie(ROCKET_INDEX, height=220, key="index_start")
         # run in background thread
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(run_index_background, analyzer, uploaded_file)
+        executor.submit(run_index_background, analyzer, uploaded_file)
         st.info("Indexing started in background. Progress will appear below.")
+
     # Poll UI for progress updates
     if "_index_progress" in st.session_state:
         prog = st.session_state["_index_progress"]
@@ -430,5 +466,6 @@ st.markdown(
 - Use the "Start Indexing" button after uploading a PDF to run indexing in the background.
 - Tune HNSW parameters in the top of the file (`HNSW_M`, `HNSW_EF_CONSTRUCTION`, `EF_SEARCH_DEFAULT`) for your dataset.
 - Replace placeholder functions (PDF reading, sentence splitting, model, reranker, and Lottie rendering) with your production implementations.
+- The embedding cache is stored as `.npy` files in the store directory; delete them to force recomputation.
 """
 )
