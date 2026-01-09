@@ -2,24 +2,27 @@ import os
 import json
 import hashlib
 import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 import numpy as np
 import faiss
 import streamlit as st
+import torch
 from PyPDF2 import PdfReader
 from sentence_transformers import SentenceTransformer, CrossEncoder
 
 # =========================
-# Config
+# Config (AUTO GPU SAFE)
 # =========================
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 STORE_DIR = "store"
-USE_GPU = True
 SUMMARY_SENTENCES = 5
-CHUNK_SIZE = 4       # sentences per chunk
-CHUNK_STRIDE = 2     # overlap
+CHUNK_SIZE = 4
+CHUNK_STRIDE = 2
+
+USE_GPU = torch.cuda.is_available()
+DEVICE = "cuda" if USE_GPU else "cpu"
 
 # =========================
 # Helpers
@@ -62,8 +65,7 @@ def split_sentences(text: str) -> List[str]:
 def chunk_sentences(sentences: List[str]) -> List[str]:
     chunks = []
     for i in range(0, len(sentences) - CHUNK_SIZE + 1, CHUNK_STRIDE):
-        chunk = " ".join(sentences[i:i + CHUNK_SIZE])
-        chunks.append(chunk)
+        chunks.append(" ".join(sentences[i:i + CHUNK_SIZE]))
     return chunks
 
 
@@ -74,7 +76,7 @@ def embed(model, texts: List[str]) -> np.ndarray:
 
 
 def maybe_gpu(index: faiss.Index) -> faiss.Index:
-    if USE_GPU:
+    if USE_GPU and faiss.get_num_gpus() > 0:
         try:
             res = faiss.StandardGpuResources()
             return faiss.index_cpu_to_gpu(res, 0, index)
@@ -92,15 +94,15 @@ def build_index(dim: int) -> faiss.Index:
 # =========================
 class EfficientPDFAnalyzer:
     def __init__(self):
-        self.model = SentenceTransformer(MODEL_NAME)
-        self.reranker = CrossEncoder(RERANK_MODEL, device="cuda" if USE_GPU else "cpu")
+        self.model = SentenceTransformer(MODEL_NAME, device=DEVICE)
+        self.reranker = CrossEncoder(RERANK_MODEL, device=DEVICE)
         ensure_dir(STORE_DIR)
 
-    def index_pdf(self, pdf_source, reindex: bool = False) -> Dict[str, Any]:
+    def index_pdf(self, pdf_source) -> Dict[str, Any]:
         doc_id = stable_doc_id(getattr(pdf_source, "name", "uploaded.pdf"))
         meta_path, idx_path = meta_paths(doc_id)
 
-        if not reindex and os.path.exists(meta_path) and os.path.exists(idx_path):
+        if os.path.exists(meta_path) and os.path.exists(idx_path):
             meta = json.load(open(meta_path, "r", encoding="utf-8"))
             return {"status": "loaded", "doc_id": doc_id, "count": len(meta["chunks"])}
 
@@ -124,7 +126,7 @@ class EfficientPDFAnalyzer:
             "config": {
                 "chunk_size": CHUNK_SIZE,
                 "stride": CHUNK_STRIDE,
-                "model": MODEL_NAME,
+                "device": DEVICE,
             }
         })
 
@@ -162,14 +164,31 @@ class EfficientPDFAnalyzer:
 
 
 # =========================
-# Streamlit UI (Animated)
+# Streamlit UI (Animated + Lottie)
 # =========================
 st.set_page_config(page_title="Advanced PDF Analyzer", layout="wide")
 st.title("📄 Advanced PDF Analyzer")
-st.caption("FAISS • Sentence Transformers • Reranking • Animations")
+st.caption(f"⚙️ Running on {'GPU' if USE_GPU else 'CPU'} | FAISS + Transformers")
+
+# ---- Optional Lottie Support (safe fallback) ----
+try:
+    from streamlit_lottie import st_lottie
+    import requests
+
+    def load_lottie(url: str):
+        r = requests.get(url, timeout=5)
+        return r.json() if r.status_code == 200 else None
+
+    LOTTIE_AVAILABLE = True
+except Exception:
+    LOTTIE_AVAILABLE = False
+
+LOTTIE_LOADING = (
+    load_lottie("https://assets2.lottiefiles.com/packages/lf20_usmfx6bp.json")
+    if LOTTIE_AVAILABLE else None
+)
 
 @st.cache_resource
-
 def get_analyzer():
     return EfficientPDFAnalyzer()
 
@@ -178,12 +197,21 @@ analyzer = get_analyzer()
 uploaded = st.file_uploader("Upload a PDF", type=["pdf"])
 
 if uploaded:
-    progress = st.progress(0)
-    progress.progress(20)
-    meta = analyzer.index_pdf(uploaded)
-    progress.progress(100)
-    st.success(f"✅ Indexed {meta['count']} chunks")
-    st.session_state["doc_id"] = meta["doc_id"]
+    col_anim, col_main = st.columns([1, 3])
+
+    with col_anim:
+        if LOTTIE_AVAILABLE and LOTTIE_LOADING:
+            st_lottie(LOTTIE_LOADING, height=200, key="upload")
+        else:
+            st.markdown("⏳ Indexing...")
+
+    with col_main:
+        progress = st.progress(0)
+        progress.progress(15)
+        meta = analyzer.index_pdf(uploaded)
+        progress.progress(100)
+        st.success(f"✅ Indexed {meta['count']} chunks")
+        st.session_state["doc_id"] = meta["doc_id"]
 
 if "doc_id" in st.session_state:
     st.divider()
@@ -193,12 +221,19 @@ if "doc_id" in st.session_state:
 
     with col1:
         if st.button("🔍 Search"):
+            anim_slot = st.empty()
+            if LOTTIE_AVAILABLE and LOTTIE_LOADING:
+                anim_slot.lottie(LOTTIE_LOADING, height=150, key="search")
             results = analyzer.search(query, st.session_state["doc_id"])
+            anim_slot.empty()
             for r in results:
                 st.markdown(f"- {r}")
 
     with col2:
         if st.button("📌 Generate Summary"):
-            with st.spinner("📝 Summarizing..."):
-                summary = analyzer.extractive_summary(st.session_state["doc_id"], SUMMARY_SENTENCES)
+            anim_slot = st.empty()
+            if LOTTIE_AVAILABLE and LOTTIE_LOADING:
+                anim_slot.lottie(LOTTIE_LOADING, height=150, key="summary")
+            summary = analyzer.extractive_summary(st.session_state["doc_id"], SUMMARY_SENTENCES)
+            anim_slot.empty()
             st.info(summary)
