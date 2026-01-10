@@ -121,8 +121,9 @@ class EfficientPDFAnalyzer:
             raise ValueError("Document not indexed")
         sentences, index = meta["sentences"], meta["index"]
 
-        # Set efSearch for better recall
-        index.index.hnsw.efSearch = HNSW_EF_SEARCH
+        # Set efSearch for better recall if available
+        if hasattr(index.index, 'hnsw'):
+            index.index.hnsw.efSearch = HNSW_EF_SEARCH
 
         q_emb = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True, device=self.device).astype("float32")
         _, I = index.search(q_emb, min(top_k * 3, index.ntotal))
