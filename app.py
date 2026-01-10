@@ -10,18 +10,22 @@ import streamlit as st
 from typing import List, Dict, Any, Optional
 import time
 import torch
+from transformers import pipeline
 
 # -------------------------
 # Config
 # -------------------------
-MODEL_NAME = "BAAI/bge-large-en-v1.5"  # Upgraded to a top-notch sentence embedding model for better performance
-RERANK_MODEL = "BAAI/bge-reranker-large"  # Upgraded to a state-of-the-art cross-encoder for superior reranking
+MODEL_NAME = "BAAI/bge-large-en-v1.5"  # Top-notch sentence embedding model
+RERANK_MODEL = "BAAI/bge-reranker-large"  # State-of-the-art cross-encoder for reranking
+SUMMARIZER_MODEL = "facebook/bart-large-cnn"  # Abstractive summarization model
 STORE_DIR = "store"
 USE_GPU = True
-SUMMARY_SENTENCES = 5
-HNSW_M = 64  # Increased for higher dimensionality and better graph connectivity
-HNSW_EF_CONSTRUCTION = 200  # Good for graph quality
-HNSW_EF_SEARCH = 128  # Increased for improved recall on larger models
+CHUNK_SIZE = 1000  # Chunk size for handling long texts in summarization (characters)
+SUMMARY_MAX_LENGTH = 300  # Max length for final summary
+SUMMARY_MIN_LENGTH = 100  # Min length for final summary
+HNSW_M = 64  # For FAISS HNSW
+HNSW_EF_CONSTRUCTION = 200
+HNSW_EF_SEARCH = 128
 
 # -------------------------
 # Helpers
@@ -60,6 +64,7 @@ class EfficientPDFAnalyzer:
         self.device = 'cuda' if USE_GPU and torch.cuda.is_available() else 'cpu'
         self.model = SentenceTransformer(model_name, device=self.device)
         self.reranker = CrossEncoder(RERANK_MODEL)
+        self.summarizer = pipeline("summarization", model=SUMMARIZER_MODEL, device=0 if self.device == 'cuda' else -1)
         self.store_dir = store_dir
         ensure_dir(self.store_dir)
 
@@ -93,19 +98,15 @@ class EfficientPDFAnalyzer:
     def index_pdf(self, pdf_source, doc_id: Optional[str] = None, reindex: bool = False) -> dict:
         inferred_id = stable_doc_id(getattr(pdf_source, "name", "uploaded.pdf"))
         doc_id = doc_id or inferred_id
-
         if not reindex and self.load_if_exists(doc_id):
             return {"status": "loaded from disk", "doc_id": doc_id, "count": len(st.session_state["meta"]["sentences"])}
-
         sentences = split_sentences(read_pdf_text(pdf_source))
         if not sentences:
             raise ValueError("No readable sentences extracted")
-
         embeddings = batch_encode(self.model, sentences, self.device)
         index = build_index(embeddings)
         ids = np.arange(len(sentences), dtype="int64")
         index.add_with_ids(embeddings, ids)
-
         self.save_to_disk(doc_id, sentences, embeddings, index)
         st.session_state["meta"] = {
             "doc_id": doc_id,
@@ -115,49 +116,56 @@ class EfficientPDFAnalyzer:
         }
         return {"status": "indexed", "doc_id": doc_id, "count": len(sentences)}
 
-    def search(self, query: str, top_k: int = 3) -> List[str]:
+    def search(self, query: str, top_k: int = 5) -> List[str]:
         meta = st.session_state.get("meta", {})
         if not meta:
             raise ValueError("Document not indexed")
         sentences, index = meta["sentences"], meta["index"]
-
-        # Set efSearch for better recall if available
         if hasattr(index.index, 'hnsw'):
             index.index.hnsw.efSearch = HNSW_EF_SEARCH
-
         q_emb = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True, device=self.device).astype("float32")
         _, I = index.search(q_emb, min(top_k * 3, index.ntotal))
         candidates = [sentences[int(idx)] for idx in I[0] if idx != -1]
-
         pairs = [(query, cand) for cand in candidates]
         scores = self.reranker.predict(pairs)
         ranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
         return [sent for sent, _ in ranked[:top_k]]
 
-    def extractive_summary(self, num_sentences: int = SUMMARY_SENTENCES) -> str:
+    def summarize_long_text(self, text: str, chunk_size: int = CHUNK_SIZE, max_length: int = SUMMARY_MAX_LENGTH, min_length: int = SUMMARY_MIN_LENGTH) -> str:
+        # Split into overlapping chunks
+        chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size - 200)]  # 200 char overlap
+        summaries = []
+        chunk_max = max(130, max_length // len(chunks) + 1)  # Dynamic max_length per chunk
+        chunk_min = max(30, min_length // len(chunks) + 1)
+        for chunk in chunks:
+            if chunk.strip():
+                summary = self.summarizer(chunk, max_length=chunk_max, min_length=chunk_min, do_sample=False)[0]['summary_text']
+                summaries.append(summary)
+        combined = " ".join(summaries)
+        # If combined is still too long, recursively summarize
+        if len(combined) > chunk_size * 1.5:
+            return self.summarize_long_text(combined, chunk_size, max_length, min_length)
+        else:
+            return self.summarizer(combined, max_length=max_length, min_length=min_length, do_sample=False)[0]['summary_text']
+
+    def abstractive_summary(self, max_length: int = SUMMARY_MAX_LENGTH, min_length: int = SUMMARY_MIN_LENGTH) -> str:
         meta = st.session_state.get("meta", {})
         if not meta:
             raise ValueError("Document not indexed")
-        sentences = meta["sentences"]
-        embeddings = meta["embeddings"]
-        centroid = np.mean(embeddings, axis=0, keepdims=True)
-        faiss.normalize_L2(centroid)
-        tmp = faiss.IndexFlatIP(embeddings.shape[1])
-        tmp.add(embeddings)
-        _, I = tmp.search(centroid, min(num_sentences, len(sentences)))
-        return " ".join(sentences[int(i)] for i in I[0])
+        full_text = " ".join(meta["sentences"])
+        return self.summarize_long_text(full_text, max_length=max_length, min_length=min_length)
 
 # -------------------------
 # Streamlit App with Animations
 # -------------------------
-st.title("📄 Top-Notch PDF Analyzer (Optimized + Animated)")
+st.title("📄 Most Effective PDF Analyzer (with Abstractive Summarization)")
 
 analyzer = EfficientPDFAnalyzer()
 
 # File browsing animation
 st.info("📂 Ready to browse files... Upload a PDF to analyze!")
-
 uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
+
 if uploaded_file is not None:
     # Settings gear spinner during indexing
     with st.spinner("⚙️ Indexing your PDF... Please wait"):
@@ -184,13 +192,13 @@ if "doc_id" in st.session_state:
             except Exception as e:
                 st.error(f"Error during search: {e}")
 
-    if st.button("Generate Summary"):
-        with st.spinner("📌 Creating summary..."):
+    if st.button("Generate Abstractive Summary"):
+        with st.spinner("📌 Creating abstractive summary..."):
             time.sleep(1.2)
             try:
-                summary_text = analyzer.extractive_summary(num_sentences=SUMMARY_SENTENCES)
-                st.success("🎉 Summary generated successfully!")
-                st.write("### 📌 Extractive Summary")
+                summary_text = analyzer.abstractive_summary()
+                st.success("🎉 Abstractive summary generated successfully!")
+                st.write("### 📌 Abstractive Summary")
                 st.info(summary_text)
             except Exception as e:
                 st.error(f"Error generating summary: {e}")
