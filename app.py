@@ -10,18 +10,21 @@ import streamlit as st
 from typing import List, Dict, Any, Optional
 import time
 import torch
+from rank_bm25 import BM25Okapi
+from tqdm import tqdm
 
 # -------------------------
 # Config
 # -------------------------
-MODEL_NAME = "BAAI/bge-large-en-v1.5"  # Upgraded to a top-notch sentence embedding model for better performance
-RERANK_MODEL = "BAAI/bge-reranker-large"  # Upgraded to a state-of-the-art cross-encoder for superior reranking
+MODEL_NAME = "intfloat/e5-large-v2"  # Top-tier for semantic search, better asymmetric handling
+RERANK_MODEL = "BAAI/bge-reranker-large"  # Solid reranker
 STORE_DIR = "store"
 USE_GPU = True
 SUMMARY_SENTENCES = 5
-HNSW_M = 64  # Increased for higher dimensionality and better graph connectivity
-HNSW_EF_CONSTRUCTION = 200  # Good for graph quality
-HNSW_EF_SEARCH = 128  # Increased for improved recall on larger models
+HNSW_M = 128  # Higher for denser graphs in larger dims (1024 for e5-large)
+HNSW_EF_CONSTRUCTION = 300  # Boost build quality
+HNSW_EF_SEARCH = 256  # Max recall for queries
+HYBRID_ALPHA = 0.5  # Blend factor for hybrid search (0=semantic only, 1=keyword only)
 
 # -------------------------
 # Helpers
@@ -42,7 +45,7 @@ def split_sentences(text: str) -> List[str]:
     return [s for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s]
 
 def batch_encode(model, sentences: List[str], device: str) -> np.ndarray:
-    emb = model.encode(sentences, convert_to_numpy=True, normalize_embeddings=True, batch_size=32, device=device).astype("float32")
+    emb = model.encode(sentences, convert_to_numpy=True, normalize_embeddings=True, batch_size=64, device=device).astype("float32")  # Larger batch for speed
     faiss.normalize_L2(emb)
     return emb
 
@@ -52,10 +55,26 @@ def build_index(embeddings: np.ndarray) -> faiss.IndexIDMap2:
     hnsw_index.hnsw.efConstruction = HNSW_EF_CONSTRUCTION
     return faiss.IndexIDMap2(hnsw_index)
 
+def mmr_rerank(query_emb: np.ndarray, doc_embs: np.ndarray, docs: List[str], lambda_param: float = 0.5, k: int = 5) -> List[str]:
+    selected = []
+    for _ in range(k):
+        if not doc_embs.size:
+            break
+        sim_to_query = np.dot(doc_embs, query_emb.T).flatten()
+        if selected:
+            sim_to_selected = np.dot(doc_embs, np.array([doc_embs[i] for i in selected]).T).max(axis=1)
+            scores = lambda_param * sim_to_query - (1 - lambda_param) * sim_to_selected
+        else:
+            scores = sim_to_query
+        idx = np.argmax(scores)
+        selected.append(idx)
+        doc_embs = np.delete(doc_embs, idx, axis=0)
+    return [docs[i] for i in selected]
+
 # -------------------------
 # Analyzer
 # -------------------------
-class EfficientPDFAnalyzer:
+class TopNotchPDFAnalyzer:
     def __init__(self, model_name: str = MODEL_NAME, store_dir: str = STORE_DIR):
         self.device = 'cuda' if USE_GPU and torch.cuda.is_available() else 'cpu'
         self.model = SentenceTransformer(model_name, device=self.device)
@@ -101,36 +120,48 @@ class EfficientPDFAnalyzer:
         if not sentences:
             raise ValueError("No readable sentences extracted")
 
-        embeddings = batch_encode(self.model, sentences, self.device)
-        index = build_index(embeddings)
-        ids = np.arange(len(sentences), dtype="int64")
-        index.add_with_ids(embeddings, ids)
+        with st.progress(0) as progress_bar:
+            embeddings = batch_encode(self.model, sentences, self.device)
+            progress_bar.update(50)
+            index = build_index(embeddings)
+            ids = np.arange(len(sentences), dtype="int64")
+            index.add_with_ids(embeddings, ids)
+            progress_bar.update(100)
 
         self.save_to_disk(doc_id, sentences, embeddings, index)
         st.session_state["meta"] = {
             "doc_id": doc_id,
             "sentences": sentences,
             "index": index,
-            "embeddings": embeddings
+            "embeddings": embeddings,
+            "bm25": BM25Okapi([sent.split() for sent in sentences])  # For hybrid
         }
         return {"status": "indexed", "doc_id": doc_id, "count": len(sentences)}
 
-    def search(self, query: str, top_k: int = 3) -> List[str]:
+    def search(self, query: str, top_k: int = 5, hybrid: bool = True) -> List[str]:
         meta = st.session_state.get("meta", {})
         if not meta:
             raise ValueError("Document not indexed")
-        sentences, index = meta["sentences"], meta["index"]
+        sentences, index, embeddings, bm25 = meta["sentences"], meta["index"], meta["embeddings"], meta.get("bm25")
 
-        # Set efSearch for better recall if available
         if hasattr(index.index, 'hnsw'):
             index.index.hnsw.efSearch = HNSW_EF_SEARCH
 
         q_emb = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True, device=self.device).astype("float32")
-        _, I = index.search(q_emb, min(top_k * 3, index.ntotal))
-        candidates = [sentences[int(idx)] for idx in I[0] if idx != -1]
+        _, sem_I = index.search(q_emb, min(top_k * 5, index.ntotal))  # Fetch more for hybrid/rerank
+        sem_candidates_idx = [int(idx) for idx in sem_I[0] if idx != -1]
 
+        if hybrid and bm25:
+            bm25_scores = bm25.get_scores(query.split())
+            hybrid_scores = HYBRID_ALPHA * np.array([np.dot(embeddings[i], q_emb[0]) for i in range(len(sentences))]) + (1 - HYBRID_ALPHA) * bm25_scores
+            hybrid_idx = np.argsort(hybrid_scores)[::-1][:len(sem_candidates_idx)]
+            candidates_idx = list(set(sem_candidates_idx) & set(hybrid_idx)) or sem_candidates_idx  # Intersection or fallback
+        else:
+            candidates_idx = sem_candidates_idx
+
+        candidates = [sentences[idx] for idx in candidates_idx]
         pairs = [(query, cand) for cand in candidates]
-        scores = self.reranker.predict(pairs)
+        scores = self.reranker.predict(pairs, batch_size=32)  # Batched for speed
         ranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
         return [sent for sent, _ in ranked[:top_k]]
 
@@ -138,45 +169,39 @@ class EfficientPDFAnalyzer:
         meta = st.session_state.get("meta", {})
         if not meta:
             raise ValueError("Document not indexed")
-        sentences = meta["sentences"]
-        embeddings = meta["embeddings"]
-        centroid = np.mean(embeddings, axis=0, keepdims=True)
-        faiss.normalize_L2(centroid)
-        tmp = faiss.IndexFlatIP(embeddings.shape[1])
-        tmp.add(embeddings)
-        _, I = tmp.search(centroid, min(num_sentences, len(sentences)))
-        return " ".join(sentences[int(i)] for i in I[0])
+        sentences, embeddings = meta["sentences"], meta["embeddings"]
+        q_emb = np.mean(embeddings, axis=0, keepdims=True)  # Centroid as "query"
+        selected_sentences = mmr_rerank(q_emb, embeddings.copy(), sentences, k=num_sentences)
+        return " ".join(selected_sentences)
 
 # -------------------------
 # Streamlit App with Animations
 # -------------------------
-st.title("📄 Top-Notch PDF Analyzer (Optimized + Animated)")
+st.title("📄 Top-Notch PDF Analyzer (Ultra-Optimized + Animated)")
 
-analyzer = EfficientPDFAnalyzer()
+analyzer = TopNotchPDFAnalyzer()
 
-# File browsing animation
 st.info("📂 Ready to browse files... Upload a PDF to analyze!")
 
 uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
 if uploaded_file is not None:
-    # Settings gear spinner during indexing
     with st.spinner("⚙️ Indexing your PDF... Please wait"):
         try:
             meta = analyzer.index_pdf(uploaded_file)
             st.success(f"✅ {meta['status'].capitalize()} {meta['count']} sentences from {uploaded_file.name}")
             st.session_state["doc_id"] = meta["doc_id"]
-            st.balloons()  # 🎈 celebration
+            st.balloons()
         except Exception as e:
             st.error(f"Error indexing PDF: {e}")
 
 if "doc_id" in st.session_state:
     query = st.text_input("Enter search query")
+    hybrid_toggle = st.checkbox("Use Hybrid Search (Semantic + Keyword)", value=True)
     if st.button("Search"):
-        # Simple search animation
         with st.spinner("🔍 Searching your document..."):
-            time.sleep(1)  # simulate animation
+            time.sleep(1)
             try:
-                results = analyzer.search(query, top_k=5)
+                results = analyzer.search(query, top_k=5, hybrid=hybrid_toggle)
                 st.success("✨ Results ready!")
                 st.write("### 🔍 Search Results")
                 for sentence in results:
