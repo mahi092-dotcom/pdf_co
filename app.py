@@ -9,15 +9,19 @@ import re
 import streamlit as st
 from typing import List, Dict, Any, Optional
 import time
+import torch
 
 # -------------------------
 # Config
 # -------------------------
-MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+MODEL_NAME = "BAAI/bge-large-en-v1.5"  # Upgraded to a top-notch sentence embedding model for better performance
+RERANK_MODEL = "BAAI/bge-reranker-large"  # Upgraded to a state-of-the-art cross-encoder for superior reranking
 STORE_DIR = "store"
 USE_GPU = True
 SUMMARY_SENTENCES = 5
+HNSW_M = 64  # Increased for higher dimensionality and better graph connectivity
+HNSW_EF_CONSTRUCTION = 200  # Good for graph quality
+HNSW_EF_SEARCH = 128  # Increased for improved recall on larger models
 
 # -------------------------
 # Helpers
@@ -37,14 +41,15 @@ def read_pdf_text(pdf_source) -> str:
 def split_sentences(text: str) -> List[str]:
     return [s for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s]
 
-def batch_encode(model, sentences: List[str]) -> np.ndarray:
-    emb = model.encode(sentences, convert_to_numpy=True, normalize_embeddings=True, batch_size=32).astype("float32")
+def batch_encode(model, sentences: List[str], device: str) -> np.ndarray:
+    emb = model.encode(sentences, convert_to_numpy=True, normalize_embeddings=True, batch_size=32, device=device).astype("float32")
     faiss.normalize_L2(emb)
     return emb
 
 def build_index(embeddings: np.ndarray) -> faiss.IndexIDMap2:
     dim = embeddings.shape[1]
-    hnsw_index = faiss.IndexHNSWFlat(dim, 32)  # 32 neighbors
+    hnsw_index = faiss.IndexHNSWFlat(dim, HNSW_M)
+    hnsw_index.hnsw.efConstruction = HNSW_EF_CONSTRUCTION
     return faiss.IndexIDMap2(hnsw_index)
 
 # -------------------------
@@ -52,24 +57,62 @@ def build_index(embeddings: np.ndarray) -> faiss.IndexIDMap2:
 # -------------------------
 class EfficientPDFAnalyzer:
     def __init__(self, model_name: str = MODEL_NAME, store_dir: str = STORE_DIR):
-        self.model = SentenceTransformer(model_name)
+        self.device = 'cuda' if USE_GPU and torch.cuda.is_available() else 'cpu'
+        self.model = SentenceTransformer(model_name, device=self.device)
         self.reranker = CrossEncoder(RERANK_MODEL)
         self.store_dir = store_dir
         ensure_dir(self.store_dir)
 
+    def load_if_exists(self, doc_id: str) -> bool:
+        emb_path = os.path.join(self.store_dir, f"{doc_id}.emb.npy")
+        sent_path = os.path.join(self.store_dir, f"{doc_id}.sent.json")
+        idx_path = os.path.join(self.store_dir, f"{doc_id}.index")
+        if all(os.path.exists(p) for p in [emb_path, sent_path, idx_path]):
+            embeddings = np.load(emb_path)
+            with open(sent_path, 'r') as f:
+                sentences = json.load(f)
+            index = faiss.read_index(idx_path)
+            st.session_state["meta"] = {
+                "doc_id": doc_id,
+                "sentences": sentences,
+                "index": index,
+                "embeddings": embeddings
+            }
+            return True
+        return False
+
+    def save_to_disk(self, doc_id: str, sentences: List[str], embeddings: np.ndarray, index: faiss.IndexIDMap2):
+        emb_path = os.path.join(self.store_dir, f"{doc_id}.emb.npy")
+        sent_path = os.path.join(self.store_dir, f"{doc_id}.sent.json")
+        idx_path = os.path.join(self.store_dir, f"{doc_id}.index")
+        np.save(emb_path, embeddings)
+        with open(sent_path, 'w') as f:
+            json.dump(sentences, f)
+        faiss.write_index(index, idx_path)
+
     def index_pdf(self, pdf_source, doc_id: Optional[str] = None, reindex: bool = False) -> dict:
         inferred_id = stable_doc_id(getattr(pdf_source, "name", "uploaded.pdf"))
         doc_id = doc_id or inferred_id
+
+        if not reindex and self.load_if_exists(doc_id):
+            return {"status": "loaded from disk", "doc_id": doc_id, "count": len(st.session_state["meta"]["sentences"])}
+
         sentences = split_sentences(read_pdf_text(pdf_source))
         if not sentences:
             raise ValueError("No readable sentences extracted")
 
-        embeddings = batch_encode(self.model, sentences)
+        embeddings = batch_encode(self.model, sentences, self.device)
         index = build_index(embeddings)
         ids = np.arange(len(sentences), dtype="int64")
         index.add_with_ids(embeddings, ids)
 
-        st.session_state["meta"] = {"doc_id": doc_id, "sentences": sentences, "index": index}
+        self.save_to_disk(doc_id, sentences, embeddings, index)
+        st.session_state["meta"] = {
+            "doc_id": doc_id,
+            "sentences": sentences,
+            "index": index,
+            "embeddings": embeddings
+        }
         return {"status": "indexed", "doc_id": doc_id, "count": len(sentences)}
 
     def search(self, query: str, top_k: int = 3) -> List[str]:
@@ -78,8 +121,11 @@ class EfficientPDFAnalyzer:
             raise ValueError("Document not indexed")
         sentences, index = meta["sentences"], meta["index"]
 
-        q_emb = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype("float32")
-        _, I = index.search(q_emb, min(top_k*3, index.ntotal))
+        # Set efSearch for better recall
+        index.own_index.hnsw.efSearch = HNSW_EF_SEARCH
+
+        q_emb = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True, device=self.device).astype("float32")
+        _, I = index.search(q_emb, min(top_k * 3, index.ntotal))
         candidates = [sentences[int(idx)] for idx in I[0] if idx != -1]
 
         pairs = [(query, cand) for cand in candidates]
@@ -92,7 +138,7 @@ class EfficientPDFAnalyzer:
         if not meta:
             raise ValueError("Document not indexed")
         sentences = meta["sentences"]
-        embeddings = batch_encode(self.model, sentences)
+        embeddings = meta["embeddings"]
         centroid = np.mean(embeddings, axis=0, keepdims=True)
         faiss.normalize_L2(centroid)
         tmp = faiss.IndexFlatIP(embeddings.shape[1])
@@ -103,7 +149,7 @@ class EfficientPDFAnalyzer:
 # -------------------------
 # Streamlit App with Animations
 # -------------------------
-st.title("📄 Advanced PDF Analyzer (Optimized + Animated)")
+st.title("📄 Top-Notch PDF Analyzer (Optimized + Animated)")
 
 analyzer = EfficientPDFAnalyzer()
 
@@ -116,7 +162,7 @@ if uploaded_file is not None:
     with st.spinner("⚙️ Indexing your PDF... Please wait"):
         try:
             meta = analyzer.index_pdf(uploaded_file)
-            st.success(f"✅ Indexed {meta['count']} sentences from {uploaded_file.name}")
+            st.success(f"✅ {meta['status'].capitalize()} {meta['count']} sentences from {uploaded_file.name}")
             st.session_state["doc_id"] = meta["doc_id"]
             st.balloons()  # 🎈 celebration
         except Exception as e:
