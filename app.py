@@ -122,7 +122,7 @@ class EfficientPDFAnalyzer:
         sentences, index = meta["sentences"], meta["index"]
 
         # Set efSearch for better recall
-        index.own_index.hnsw.efSearch = HNSW_EF_SEARCH
+        index.index.hnsw.efSearch = HNSW_EF_SEARCH
 
         q_emb = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True, device=self.device).astype("float32")
         _, I = index.search(q_emb, min(top_k * 3, index.ntotal))
